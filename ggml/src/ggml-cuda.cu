@@ -3255,6 +3255,15 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
 
             int result = i + 1;
 
+            // The kernels skip rows whose expert id is negative (SER, LLAMA_HOT_EXPERTS misses).
+            // Unlike ggml_cuda_mul_mat_id, this fused path does not clear its output first: do it here.
+            {
+                const bool to_add_id = i+2 < graph->n_nodes && graph->nodes[i+2]->op == GGML_OP_ADD_ID &&
+                    graph->nodes[i+2]->src[0] == next && graph->nodes[i+2]->src[2] == ids;
+                ggml_tensor * out = to_add_id ? graph->nodes[i+2] : next;
+                CUDA_CHECK(cudaMemsetAsync(out->data, 0, ggml_nbytes(out), stream));
+            }
+
             //printf("next: %ld x %ld x %ld x %ld,    %zu x %zu x %zu x %zu\n", next->ne[0], next->ne[1], next->ne[2], next->ne[3], next->nb[0], next->nb[1], next->nb[2], next->nb[3]);
 
             for (int iy = 0; iy < Ny; ++iy) {
