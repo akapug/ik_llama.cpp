@@ -10970,6 +10970,28 @@ struct ggml_tensor * ggml_top_k_thresh(
     return result;
 }
 
+struct ggml_tensor * ggml_top_k_thresh_w(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * w,
+        int                   k,
+        int                   min_entries,
+        float                 thresh) {
+    GGML_ASSERT(a->ne[0] >= k && min_entries > 0 && thresh > 0);
+    GGML_ASSERT(w->type == GGML_TYPE_F32 && ggml_are_same_shape(a, w) && ggml_is_contiguous(w));
+
+    struct ggml_tensor * result = ggml_argsort_thresh(ctx, a, min_entries, thresh);
+    ggml_set_op_params_i32(result, 2, k);
+    result->src[1] = w;
+
+    result = ggml_view_4d(ctx, result,
+                k, result->ne[1], result->ne[2], result->ne[3],
+                   result->nb[1], result->nb[2], result->nb[3],
+                0);
+
+    return result;
+}
+
 // ggml_latent_attn_ext_impl
 
 static struct ggml_tensor * ggml_latent_attn_ext_impl(
@@ -23313,6 +23335,8 @@ static void ggml_compute_forward_argsort_thresh_f32(
 
     int min_entries = ggml_get_op_params_i32(dst, 0);
     float thresh    = ggml_get_op_params_f32(dst, 1);
+    const struct ggml_tensor * w = dst->src[1];
+    const int wk = w ? MIN((int)ne0, MAX(1, ggml_get_op_params_i32(dst, 2))) : 0;
 
     //if (ith == 0) printf("%s: min_entries = %d, thresh = %g\n", __func__, min_entries, (double)thresh);
 
@@ -23334,10 +23358,16 @@ static void ggml_compute_forward_argsort_thresh_f32(
                 }
             }
         }
-        float max_value = src_data[dst_data[0]];
+        // src[1] (optional): threshold on these values (e.g. unbiased routing probs) instead of the sort key,
+        // relative to their max over the top op_params[2] entries
+        const float * thr_data = w ? (const float *)((const char *) w->data + i*w->nb[1]) : src_data;
+        float max_value = thr_data[dst_data[0]];
+        if (w) {
+            for (int j = 1; j < wk; ++j) max_value = MAX(max_value, thr_data[dst_data[j]]);
+        }
         //printf("Row %ld: max_value is %g, next is %g\n", i, (double)max_value, (double)src_data[dst_data[1]]);
         for (int j = min_entries; j < ne0; ++j) {
-            if (src_data[dst_data[j]] < max_value*thresh) {
+            if (thr_data[dst_data[j]] < max_value*thresh) {
                 //printf("    row %ld: turning off expert %d(%d) with value %g\n", i, j, dst_data[j], (double)src_data[dst_data[j]]);
                 dst_data[j] = -1;
             }

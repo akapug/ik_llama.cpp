@@ -8903,6 +8903,7 @@ struct llama_context_params llama_context_default_params() {
         /*.dsa_top_k                   =*/ -1,
         /*.min_experts                 =*/ -1,
         /*.thtesh_experts              =*/ 0.0f,
+        /*.ser_max_batch               =*/ 0,
         /*.only_active_experts         =*/ false,
         /*.prefetch_experts            =*/ false,
         /*.prefetch_experts_threads    =*/ 0,
@@ -9413,8 +9414,6 @@ struct llama_context * llama_init_from_model(
     cparams.grouped_expert_routing = params.grouped_expert_routing;
     cparams.fused_up_gate    = params.fused_up_gate;
     cparams.fused_mmad       = params.fused_mmad;
-    cparams.min_experts      = params.min_experts;
-    cparams.thresh_experts   = params.thresh_experts;
     cparams.rope_cache       = params.rope_cache;
     cparams.graph_reuse      = params.graph_reuse;
     cparams.dsa              = params.dsa;
@@ -9455,6 +9454,7 @@ struct llama_context * llama_init_from_model(
     cparams.scheduler_async  = params.scheduler_async;
     cparams.min_experts      = params.min_experts;
     cparams.thresh_experts   = params.thresh_experts;
+    cparams.ser_max_batch    = params.ser_max_batch;
     cparams.cuda_params      = params.cuda_params;
     cparams.mtp              = params.mtp;
     cparams.moe_cache_size   = params.moe_cache_size;
@@ -9600,9 +9600,6 @@ struct llama_context * llama_init_from_model(
     LLAMA_LOG_INFO("%s: grouped er    = %d\n",     __func__, cparams.grouped_expert_routing);
     LLAMA_LOG_INFO("%s: fused_up_gate = %d\n",     __func__, cparams.fused_up_gate);
     LLAMA_LOG_INFO("%s: fused_mmad    = %d\n",     __func__, cparams.fused_mmad);
-    if (cparams.min_experts > 0 && cparams.thresh_experts > 0) {
-        LLAMA_LOG_INFO("%s: ser           = %d, %g\n", __func__, cparams.min_experts, cparams.thresh_experts);
-    }
     LLAMA_LOG_INFO("%s: rope_cache    = %d\n",     __func__, cparams.rope_cache);
     LLAMA_LOG_INFO("%s: graph_reuse   = %d\n",     __func__, cparams.graph_reuse);
     if (model->arch == LLM_ARCH_GLM_DSA) {
@@ -9624,7 +9621,7 @@ struct llama_context * llama_init_from_model(
     //LLAMA_LOG_INFO("%s: split_mode_f16= %d\n",     __func__, cparams.split_mode_f16);
     LLAMA_LOG_INFO("%s: reduce_type   = %s\n",     __func__, ggml_type_name(cparams.reduce_type));
     LLAMA_LOG_INFO("%s: sched_async   = %d\n",     __func__, cparams.scheduler_async);
-    LLAMA_LOG_INFO("%s: ser           = %d, %g\n", __func__, cparams.min_experts, cparams.thresh_experts);
+    LLAMA_LOG_INFO("%s: ser           = %d, %g, max_batch %d\n", __func__, cparams.min_experts, cparams.thresh_experts, cparams.ser_max_batch);
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n",   __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",     __func__, cparams.rope_freq_scale);
     if (cparams.cuda_params) {
