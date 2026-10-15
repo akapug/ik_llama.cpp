@@ -4722,6 +4722,8 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.grouped_expert_routing = params.grouped_expert_routing;
     cparams.fused_up_gate     = params.fused_up_gate;
     cparams.fused_mmad        = params.fused_mmad;
+    cparams.min_experts       = params.min_experts;
+    cparams.thresh_experts    = params.thresh_experts;
     cparams.rope_cache        = params.rope_cache;
     cparams.graph_reuse       = params.graph_reuse;
     cparams.dsa               = params.dsa;

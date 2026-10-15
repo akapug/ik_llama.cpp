@@ -451,31 +451,33 @@ void iqk_mul_multi_add(struct ggml_tensor * dst, int ith, int nth) {
 
     auto src2 = dst->src[2];
     auto src3 = dst->src[3];
-    if (src2 && src3) {
-        GGML_ASSERT(src2->type == GGML_TYPE_F32);
+    if (src3) {
+        // src3 = expert ids, src2 = optional per-expert scales (down_exps_s). SER (-ser) marks a dropped
+        // slot with id -1: its expert row was not computed (may be garbage on some backends), so skip it.
+        // Without -1 ids this is the same arithmetic, in the same order, as before.
+        GGML_ASSERT(!src2 || src2->type == GGML_TYPE_F32);
         GGML_ASSERT(src3->type == GGML_TYPE_I32);
         GGML_ASSERT(src3->ne[0] == src0->ne[1]);
 
         auto cids = (const char *)src3->data;
-        auto scales = (const float *)src2->data;
+        auto scales = src2 ? (const float *)src2->data : nullptr;
         for (int ir = first; ir < last; ++ir) {
-            auto c0 = (const char *)src0->data + ir*src0->nb[2];
-            auto c1 = (const char *)src1->data + ir*src1->nb[2];
-            auto cy = (      char *)dst->data + ir* dst->nb[1];
-            auto  y = (     float *)cy;
-            auto x0 = (const float *)c0;
-            auto x1 = (const float *)c1;
+            auto y   = (float *)((char *)dst->data + ir*dst->nb[1]);
             auto ids = (const int *)(cids + ir*src3->nb[1]);
-            float s = scales[ids[0]] * x1[0];
-            for (int k = 0; k < ne00; ++k) y[k] = x0[k] * s;
-            for (int j = 1; j < ne01; ++j) {
-                c0 += src0->nb[1];
-                c1 += src1->nb[1];
-                x0 = (const float *)c0;
-                x1 = (const float *)c1;
-                s  = x1[0] * scales[ids[j]];
-                for (int k = 0; k < ne00; ++k) y[k] += x0[k] * s;
+            bool first_term = true;
+            for (int j = 0; j < ne01; ++j) {
+                if (ids[j] < 0) continue;
+                auto x0 = (const float *)((const char *)src0->data + ir*src0->nb[2] + j*src0->nb[1]);
+                auto x1 = (const float *)((const char *)src1->data + ir*src1->nb[2] + j*src1->nb[1]);
+                float s = scales ? x1[0] * scales[ids[j]] : x1[0];
+                if (first_term) {
+                    for (int k = 0; k < ne00; ++k) y[k] = x0[k] * s;
+                    first_term = false;
+                } else {
+                    for (int k = 0; k < ne00; ++k) y[k] += x0[k] * s;
+                }
             }
+            if (first_term) std::memset(y, 0, ne00*sizeof(float));
         }
 
         return;
