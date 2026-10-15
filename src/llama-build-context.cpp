@@ -4,6 +4,7 @@
 #include "llama-model.h"
 #include "llama-context.h"
 #include "llama-moe-cache.h"
+#include "llama-expert-place.h"
 #include "llama-delta-net.h"
 
 #include "ggml.h"
@@ -1686,6 +1687,71 @@ llm_expert_gating_func_type   gating_op,
 
     cur = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
 
+    // Static GPU hot-expert set (LLAMA_HOT_EXPERTS): for small batches the routed experts that have a
+    // copy in the GPU bank run there (misses get id -1, which the CUDA decode kernels skip), the rest run
+    // on the CPU from the full tensors (hits get id -1, which the CPU kernels zero-fill); the sum of the
+    // two outputs equals the single-path expert output row by row.
+    ggml_tensor * experts = nullptr;
+    llama_hot_experts::layer_view hot;
+    if (!cache_ids && lctx.hot_experts && lctx.lora_adapters.empty() && !weight_before_ffn &&
+            !up_exps_b && !gate_exps_b && !down_exps_b && !up_gate_exps_b && !down_exps_s &&
+            (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU || type_op == LLM_FFN_SWIGLU_OAI) &&
+            lctx.hot_experts->layer(il, n_tokens, hot)) {
+        ggml_tensor * flat = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx, selected_experts);
+        flat = ggml_reshape_1d(ctx, flat, n_expert_used*n_tokens);
+        ggml_tensor * hot_ids  = ggml_get_rows(ctx, hot.hot_map, flat);
+        ggml_tensor * cold_ids = ggml_get_rows(ctx, hot.cold_map, flat);
+        ggml_backend_sched_set_tensor_backend(lctx.sched, hot_ids, hot.backend);
+        ggml_backend_sched_set_tensor_backend(lctx.sched, cold_ids, hot.cpu);
+        hot_ids  = ggml_reshape_2d(ctx, hot_ids,  n_expert_used, n_tokens);
+        cold_ids = ggml_reshape_2d(ctx, cold_ids, n_expert_used, n_tokens);
+        cb(hot_ids, "ffn_moe_hot_ids", il);
+        cb(cold_ids, "ffn_moe_cold_ids", il);
+        const ggml_unary_op uop = type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
+                                  type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI;
+        const float limit = lctx.model.swiglu_limit(il, false);
+        auto unary = [&](ggml_tensor * gate, ggml_tensor * up) {
+            if (type_op == LLM_FFN_SWIGLU_OAI) return ggml_swiglu_oai(ctx, gate, up, 1.702f, 7.0f);
+            ggml_tensor * r = ggml_fused_mul_unary(ctx, gate, up, uop);
+            *((float *)(r->op_params + 1)) = limit;
+            return r;
+        };
+        // w_* are the tensors to multiply (bank or full), the originals select the hadamard rotation
+        auto path = [&](ggml_tensor * w_up, ggml_tensor * w_gate, ggml_tensor * w_up_gate, ggml_tensor * w_down,
+                        ggml_tensor * ids, const char * tag) {
+            ggml_tensor * par;
+            if (w_up_gate) {
+                par = type_op == LLM_FFN_SWIGLU_OAI ?
+                    ggml_moe_up_gate_ext(ctx, w_up_gate, nullptr, cur, ids, nullptr, nullptr, uop) :
+                    ggml_moe_up_gate(ctx, w_up_gate, nullptr, cur, ids, uop);
+                *((float *)(par->op_params + 1)) = limit;
+            } else if (lctx.cparams.fused_moe_up_gate && w_up->type == w_gate->type) {
+                par = type_op == LLM_FFN_SWIGLU_OAI ?
+                    ggml_moe_up_gate_ext(ctx, w_up, w_gate, cur, ids, nullptr, nullptr, uop) :
+                    ggml_moe_up_gate(ctx, w_up, w_gate, cur, ids, uop);
+                *((float *)(par->op_params + 1)) = limit;
+            } else {
+                ggml_tensor * up   = llm_build_lora_mm_id(lctx, ctx, up_exps,   cur, ids, w_up,   nullptr);
+                ggml_tensor * gate = llm_build_lora_mm_id(lctx, ctx, gate_exps, cur, ids, w_gate, nullptr);
+                if (graph) {
+                    ggml_build_forward_expand(graph, up);
+                    ggml_build_forward_expand(graph, gate);
+                }
+                par = unary(gate, up);
+            }
+            cb(par, (std::string("ffn_moe_gate_par_") + tag).c_str(), il);
+            ggml_tensor * out = llm_build_lora_mm_id(lctx, ctx, down_exps, par, ids, w_down, nullptr);
+            cb(out, (std::string("ffn_moe_down_") + tag).c_str(), il);
+            return out;
+        };
+        auto * hk = lctx.hot_experts.get();
+        ggml_tensor * hot_out  = path(hk->bank(up_exps), hk->bank(gate_exps), hk->bank(up_gate_exps), hk->bank(down_exps), hot_ids, "hot");
+        ggml_tensor * cold_out = path(up_exps, gate_exps, up_gate_exps, down_exps, cold_ids, "cold");
+        experts = ggml_add(ctx, hot_out, cold_out);
+        ggml_backend_sched_set_tensor_backend(lctx.sched, experts, hot.backend);
+    }
+
+    if (!experts) {
     if (weight_before_ffn) {
         // TODO: this is a workaround as we don't yet have a repeat op that takes custom dim (ggml_repeat_4d)
         ggml_tensor * repeated = ggml_new_tensor_3d(ctx, cur->type, n_embd, n_expert_used, n_tokens);
@@ -1794,7 +1860,8 @@ llm_expert_gating_func_type   gating_op,
     }
     cb(par, "ffn_moe_gate_par", il);
 
-    ggml_tensor * experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, selected_experts, cached_down, cache_ids); // [n_embd, n_expert_used, n_tokens]
+    experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, selected_experts, cached_down, cache_ids); // [n_embd, n_expert_used, n_tokens]
+    }
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_b) {

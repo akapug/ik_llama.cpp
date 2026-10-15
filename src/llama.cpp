@@ -25,6 +25,7 @@
 #include "llama-hparams.h"
 #include "llama-context.h"
 #include "llama-moe-cache.h"
+#include "llama-expert-place.h"
 #include "llama-spec-features.h"
 #include "llama-dflash.h"
 #include "llama-dsv4.h"
@@ -906,6 +907,7 @@ llama_context::~llama_context() {
     free_dsv4_cache_tensors();
     ggml_backend_sched_free(sched);
     moe_cache.reset();
+    hot_experts.reset();
 
     for (ggml_backend_t backend : backends) {
         ggml_backend_free(backend);
@@ -5341,6 +5343,8 @@ static bool llm_load_tensors(
 
     // load tensor data
     if (!dry_run) {
+        // bind expert byte ranges to NUMA nodes before the data is read, so pages fault onto their target node
+        llama_expert_numa_apply(model, ml.use_mmap);
         for (auto & it : ctx_bufs) {
             ggml_context * ctx = it.first;
             auto & bufs = it.second;
@@ -5348,6 +5352,8 @@ static bool llm_load_tensors(
                 return false;
             }
         }
+
+        llama_expert_numa_report(model);
 
         if (defer_expert_mmap) {
             ml.drop_mmap_expert_pages();
@@ -9985,6 +9991,18 @@ struct llama_context * llama_init_from_model(
                     llama_free(ctx);
                     return nullptr;
                 }
+            }
+
+            try {
+                ctx->hot_experts = llama_hot_experts::create(*model, ctx->backends, backend_buft);
+            } catch (const std::exception & e) {
+                LLAMA_LOG_ERROR("%s: failed to initialize hot experts: %s\n", __func__, e.what());
+                llama_free(ctx);
+                return nullptr;
+            }
+            if (ctx->hot_experts && ctx->moe_cache) {
+                LLAMA_LOG_WARN("%s: --moe-cache-mib is active; LLAMA_HOT_EXPERTS is ignored\n", __func__);
+                ctx->hot_experts.reset();
             }
 
             // build worst-case graph
