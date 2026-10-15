@@ -4814,7 +4814,10 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
     bool cuda_graph_update_required = false;
 
     if (use_cuda_graph && graph->graph == nullptr) {
-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < CC_AMPERE) {
+        // research (homelab task/6622): GGML_CUDA_GRAPHS_PRE_AMPERE=1 keeps CUDA graphs on Turing/Volta, where decode is
+        // launch-bound (~3000 kernel launches per token measured on V4-Flash hybrid, sm_75)
+        static const bool graphs_pre_ampere = getenv("GGML_CUDA_GRAPHS_PRE_AMPERE") != nullptr;
+        if (!graphs_pre_ampere && ggml_cuda_info().devices[cuda_ctx->device].cc < CC_AMPERE) {
             graph->disable_due_to_gpu_arch = true;
 #ifndef NDEBUG
             GGML_CUDA_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
