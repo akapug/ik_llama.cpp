@@ -196,6 +196,15 @@ static common_speculative_stage_params server_parse_speculative_stage_json(const
             continue;
         }
 
+        if (item.key() == "conf_min" || item.key() == "conf_cum_min") {
+            const float value = item.value().get<float>();
+            if (!(value >= 0.0f && value <= 1.0f)) {
+                throw std::runtime_error("Error: speculative.stages[]." + item.key() + " must be within [0, 1]");
+            }
+            (item.key() == "conf_min" ? stage.conf_min : stage.conf_cum_min) = value;
+            continue;
+        }
+
         if (item.key() == "heads" || item.key() == "mtp_heads") {
             stage.mtp_heads = item.value().get<int32_t>();
             if (stage.mtp_heads < 0) {
@@ -603,6 +612,7 @@ void server_slot::reset() {
     // Reset speculative decoding stats
     n_draft_total = 0;
     n_draft_accepted = 0;
+    n_draft_rounds = 0;
     n_draft_by_depth.clear();
     n_draft_accepted_by_depth.clear();
     chat_msg = {};
@@ -910,6 +920,13 @@ void server_slot::print_timings() const {
         SLT_CNT(*this,
             "draft acceptance rate = %0.5f (%5d accepted / %5d generated)\n",
             draft_ratio, n_draft_accepted, n_draft_total
+        );
+    }
+    if (n_draft_rounds > 0) {
+        const int32_t n_verified = n_draft_by_depth.empty() ? 0 : n_draft_by_depth[0];
+        SLT_CNT(*this,
+            "mean drafted length = %0.3f per draft (%5d drafted / %5d drafts, %5d verified, %5d empty)\n",
+            (float) n_draft_total / n_draft_rounds, n_draft_total, n_draft_rounds, n_verified, n_draft_rounds - n_verified
         );
     }
     common_speculative_print_stats(spec, n_gen_second, n_decoded, n_past,
@@ -1301,6 +1318,12 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
                 }
                 if (stage_override.has_mtp_heads_override()) {
                     slot.params.speculative.stages[i].mtp_heads = stage_override.mtp_heads;
+                }
+                if (stage_override.has_conf_min_override()) {
+                    slot.params.speculative.stages[i].conf_min = stage_override.conf_min;
+                }
+                if (stage_override.has_conf_cum_min_override()) {
+                    slot.params.speculative.stages[i].conf_cum_min = stage_override.conf_cum_min;
                 }
             }
 
@@ -3699,6 +3722,7 @@ void server_context::add_sampled_tokens() {
             llama_tokens & draft = draft_result.tokens;
             auto & proposal_dists = draft_result.proposal_dists;
             slot.spec_target_only = draft_result.target_only;
+            slot.n_draft_rounds++;
 
             const int n_draft_max = slot.get_n_draft_max();
 

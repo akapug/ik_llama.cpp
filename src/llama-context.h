@@ -517,9 +517,13 @@ struct llama_context {
         input_state inputs;
         int32_t visible_cross_ctx = 0;
         bool dspark = false;
+        // DSpark confidence head: when set, the draft graph also emits sigmoid(conf_proj(...)) per position
+        bool dspark_conf = false;
 
         std::vector<llama_token> draft_tokens;
         struct ggml_tensor * draft_tokens_tensor = nullptr;
+        struct ggml_tensor * draft_conf_tensor = nullptr; // F32 [1, n_tokens], per-position acceptance confidence
+        std::vector<float> draft_conf;
         struct ggml_tensor * draft_lattice_tensor = nullptr;
         struct ggml_tensor * draft_lattice_ids_tensor = nullptr;
         std::vector<float> draft_lattice;

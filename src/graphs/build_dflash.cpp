@@ -111,6 +111,59 @@ ggml_tensor * llm_build_context::build_dspark_logits(
     return chained;
 }
 
+ggml_tensor * llm_build_context::build_dspark_confidence(
+        llm_build_context & llm,
+        ggml_tensor * head_hidden,
+        ggml_tensor * input_tokens,
+        ggml_tensor * draft_tokens) {
+    ggml_context * ctx0 = llm.ctx0;
+    const llama_model & model = llm.model;
+    ggml_tensor * w = model.dspark_conf_proj;
+    if (w == nullptr || head_hidden == nullptr || input_tokens == nullptr || draft_tokens == nullptr) {
+        return nullptr;
+    }
+
+    const int64_t n_embd   = head_hidden->ne[0];
+    const int64_t n_tokens = draft_tokens->ne[0];
+    const int64_t rank     = model.dspark_markov_w1 != nullptr ? model.dspark_markov_w1->ne[0] : 0;
+    const bool with_markov = rank > 0 && w->ne[0] == n_embd + rank;
+    if ((!with_markov && w->ne[0] != n_embd) || ggml_nelements(head_hidden) != n_embd * n_tokens) {
+        LLAMA_LOG_WARN("%s: conf_proj shape %lld does not match hidden %lld (+ markov rank %lld) x %lld draft rows; confidence disabled\n",
+                __func__, (long long) w->ne[0], (long long) n_embd, (long long) rank, (long long) n_tokens);
+        return nullptr;
+    }
+
+    // conf_proj ships as BF16; one F32 copy of the single row lets both halves act as F32 matmul operands
+    ggml_tensor * w32 = w->type == GGML_TYPE_F32 ? w : ggml_cast(ctx0, w, GGML_TYPE_F32);
+    ggml_tensor * hidden = ggml_reshape_2d(ctx0,
+            ggml_is_contiguous(head_hidden) ? head_hidden : ggml_cont(ctx0, head_hidden), n_embd, n_tokens);
+    ggml_tensor * conf = ggml_mul_mat(ctx0, ggml_view_2d(ctx0, w32, n_embd, 1, w32->nb[1], 0), hidden);
+
+    if (with_markov) {
+        // position k reads the Markov embedding of the token before it: id_last for k = 0, then the drafted tokens
+        ggml_tensor * previous = ggml_view_1d(ctx0, input_tokens, 1, 0);
+        if (n_tokens > 1) {
+            previous = ggml_concat(ctx0, previous, ggml_view_1d(ctx0, draft_tokens, n_tokens - 1, 0), 0);
+        }
+        ggml_tensor * markov = ggml_get_rows_ext(ctx0, model.dspark_markov_w1, previous, true, false);
+        if (markov->type != GGML_TYPE_F32) {
+            markov = ggml_cast(ctx0, markov, GGML_TYPE_F32);
+        }
+        ggml_tensor * w_markov = ggml_view_2d(ctx0, w32, rank, 1, w32->nb[1], (size_t) n_embd * ggml_element_size(w32));
+        conf = ggml_add(ctx0, conf, ggml_mul_mat(ctx0, w_markov, markov));
+    }
+
+    if (model.dspark_conf_proj_b != nullptr) {
+        ggml_tensor * b = model.dspark_conf_proj_b;
+        conf = ggml_add(ctx0, conf, b->type == GGML_TYPE_F32 ? b : ggml_cast(ctx0, b, GGML_TYPE_F32));
+    }
+
+    conf = ggml_sigmoid(ctx0, conf);
+    ggml_set_name(conf, "dspark_conf");
+    ggml_set_output(conf);
+    return conf;
+}
+
 ggml_cgraph * llm_build_context::build_dflash_kv_cache() {
     const int64_t n_embd_head_k = hparams.n_embd_head_k(0);
     const int64_t n_embd_head_v = hparams.n_embd_head_v(0);
@@ -635,6 +688,7 @@ ggml_cgraph * llm_build_context::build_dflash() {
     ggml_build_forward_expand(gf, result);
 
     lctx.dflash.draft_tokens_tensor = nullptr;
+    lctx.dflash.draft_conf_tensor = nullptr;
     lctx.dflash.draft_lattice_tensor = nullptr;
     lctx.dflash.draft_lattice_ids_tensor = nullptr;
     lctx.dflash.draft_lattice_top_k = 0;
@@ -710,6 +764,15 @@ ggml_cgraph * llm_build_context::build_dflash() {
     ggml_build_forward_expand(gf, result);
     ggml_build_forward_expand(gf, draft_tokens);
     lctx.dflash.draft_tokens_tensor = draft_tokens;
+
+    if (lctx.dflash.dspark && lctx.dflash.dspark_conf) {
+        ggml_tensor * head_hidden = llm_build_norm(ctx0, inpL, hparams, model.output_norm, nullptr, LLM_NORM_RMS, cb, -1);
+        ggml_tensor * conf = build_dspark_confidence(*this, head_hidden, lctx.inp_tokens, draft_tokens);
+        if (conf != nullptr) {
+            ggml_build_forward_expand(gf, conf);
+            lctx.dflash.draft_conf_tensor = conf;
+        }
+    }
 
     return gf;
 }

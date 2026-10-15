@@ -2035,6 +2035,7 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
         out = build_hc_head(ctx0, *this, hparams, n_embd, hparams.f_norm_rms_eps,
                 inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
     }
+    ggml_tensor * head_hidden = out; // pre-norm collapsed head hidden, the confidence head's input
     out = llm_build_norm(ctx0, out, hparams, model.output_norm, nullptr, LLM_NORM_RMS, cb, -1);
     out = build_output(lctx, ctx0, out, model.output, nullptr, cb);
     if (lctx.dflash.dspark) {
@@ -2045,6 +2046,7 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
     ggml_build_forward_expand(gf, out);
 
     lctx.dflash.draft_tokens_tensor = nullptr;
+    lctx.dflash.draft_conf_tensor = nullptr;
     ggml_tensor * draft_tokens = nullptr;
     ggml_tensor * result = out;
     if (lctx.dflash.dspark) {
@@ -2057,6 +2059,13 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
     ggml_build_forward_expand(gf, result);
     ggml_build_forward_expand(gf, draft_tokens);
     lctx.dflash.draft_tokens_tensor = draft_tokens;
+    if (lctx.dflash.dspark && lctx.dflash.dspark_conf) {
+        ggml_tensor * conf = build_dspark_confidence(*this, head_hidden, lctx.inp_tokens, draft_tokens);
+        if (conf != nullptr) {
+            ggml_build_forward_expand(gf, conf);
+            lctx.dflash.draft_conf_tensor = conf;
+        }
+    }
     return gf;
 }
 

@@ -4,8 +4,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <string>
 #include <random>
 #include <vector>
 
@@ -104,6 +106,15 @@ struct common_speculative_state_dflash : public common_speculative_state {
     bool is_dflash2 = false;
     bool ready = false;
 
+    // DSpark confidence-scheduled truncation (params.conf_min / params.conf_cum_min)
+    bool has_conf_head = false;
+    bool conf_missing_warned = false;
+    std::vector<float> draft_conf;
+    uint64_t conf_rounds = 0;    // drafts scored by the confidence head
+    uint64_t conf_truncated = 0; // drafts cut short by it
+    uint64_t conf_kept = 0;      // tokens kept after truncation
+    uint64_t conf_offered = 0;   // tokens drafted before truncation
+
     std::vector<common_speculative_token_dist> proposal_dists;
     std::mt19937 selector_rng;
     uint32_t selector_seed = LLAMA_DEFAULT_SEED;
@@ -152,6 +163,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
             is_dflash2 = std::atoi(selector_top_k) > 0;
         }
         const bool has_dspark_head = llama_model_dflash_has_dspark_head(model_dft);
+        has_conf_head = is_dspark && llama_model_dflash_has_dspark_conf(model_dft);
         if (is_dspark != has_dspark_head) {
             LOG_ERR("%s: %s stage requires %s DSpark Markov tensors\n", __func__,
                     is_dspark ? "dspark" : "dflash",
@@ -271,7 +283,20 @@ struct common_speculative_state_dflash : public common_speculative_state {
                 n_target_features, n_target_layers,
                 (double) target_window_ring.size() * sizeof(float) / (1024.0 * 1024.0));
     }
+    void log_conf_stats(const char * when) const {
+        if (conf_rounds == 0) {
+            return;
+        }
+        LOG_INF("%s: DSpark confidence truncation (%s): drafts=%llu truncated=%llu mean_len=%.3f of %.3f\n",
+                __func__, when,
+                (unsigned long long) conf_rounds,
+                (unsigned long long) conf_truncated,
+                (double) conf_kept / (double) conf_rounds,
+                (double) conf_offered / (double) conf_rounds);
+    }
+
     ~common_speculative_state_dflash() override {
+        log_conf_stats("total since last begin");
         if (rebuild_count > 0) {
             LOG_INF("%s: DFlash cache rebuilds=%llu rows=%llu rebuild+decode=%.3f ms rows/token=%.3f host_ring_wraps=%llu\n",
                     __func__,
@@ -301,6 +326,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
         rebuild_decode_time_us = 0;
         generated_tokens = 0;
         target_window_ring_wraps = 0;
+        log_conf_stats("previous request");
+        conf_rounds = 0;
+        conf_truncated = 0;
+        conf_kept = 0;
+        conf_offered = 0;
     }
 
     void draft(
@@ -357,6 +387,13 @@ struct common_speculative_state_dflash : public common_speculative_state {
             LOG_ERR("%s: failed to set DFlash target features\n", __func__);
             return;
         }
+
+        const bool want_conf = is_dspark && (params.conf_min > 0.0f || params.conf_cum_min > 0.0f);
+        if (want_conf && !has_conf_head && !conf_missing_warned) {
+            LOG_WRN("%s: conf_min/conf_cum_min set but the DSpark draft has no conf_proj tensor; drafting untruncated\n", __func__);
+            conf_missing_warned = true;
+        }
+        llama_set_dflash_dspark_conf(ctx_dft, want_conf && has_conf_head);
 
         llama_kv_cache_clear(ctx_dft);
         batch.n_tokens = 0;
@@ -464,9 +501,58 @@ struct common_speculative_state_dflash : public common_speculative_state {
             result.push_back(id);
         }
 
+        if (want_conf && has_conf_head) {
+            truncate_by_confidence(params, result);
+        }
+
         generated_tokens += (uint64_t) result.size();
 
         batch.n_tokens = 0;
+    }
+
+    // Keep the draft prefix the confidence head expects to survive verification: stop at the first
+    // position whose score c_k (conf_min) or survival product c_0 * ... * c_k (conf_cum_min) falls
+    // below its threshold. Never cut below params.n_min. The target still verifies every kept token.
+    void truncate_by_confidence(const common_params_speculative & params, llama_tokens & result) {
+        draft_conf.resize(result.size());
+        const int32_t n_conf = llama_copy_dflash_draft_conf(ctx_dft, draft_conf.data(), (int32_t) draft_conf.size());
+        if (n_conf < (int32_t) result.size()) {
+            LOG_DBG("%s: confidence unavailable (%d of %d positions); draft kept whole\n",
+                    __func__, n_conf, (int) result.size());
+            return;
+        }
+
+        const size_t n_offered = result.size();
+        const size_t n_floor = (size_t) std::max<int32_t>(0, params.n_min);
+        size_t n_keep = n_offered;
+        float survival = 1.0f;
+        for (size_t k = 0; k < n_offered; ++k) {
+            const float c = draft_conf[k];
+            survival *= c;
+            if ((params.conf_min > 0.0f && c < params.conf_min) ||
+                    (params.conf_cum_min > 0.0f && survival < params.conf_cum_min)) {
+                n_keep = std::max(k, std::min(n_floor, n_offered));
+                break;
+            }
+        }
+
+        if (LOG_DEFAULT_DEBUG <= common_log_verbosity_thold) {
+            std::string scores;
+            for (size_t k = 0; k < n_offered; ++k) {
+                char buf[16];
+                std::snprintf(buf, sizeof(buf), k == 0 ? "%.3f" : " %.3f", draft_conf[k]);
+                scores += buf;
+            }
+            LOG_DBG("%s: conf=[%s] keep %zu of %zu\n", __func__, scores.c_str(), n_keep, n_offered);
+        }
+
+        conf_rounds++;
+        conf_offered += n_offered;
+        conf_kept += n_keep;
+        if (n_keep < n_offered) {
+            conf_truncated++;
+            result.resize(n_keep);
+        }
     }
 
     void accept(uint16_t n_accepted) override {

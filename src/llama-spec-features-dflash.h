@@ -79,6 +79,10 @@ void llama_reset_dflash_kv_cache_state(struct llama_context * ctx);
 void llama_set_dflash_visible_cross_ctx(struct llama_context * ctx, int32_t cross_ctx);
 int32_t llama_get_dflash_visible_cross_ctx(const struct llama_context * ctx);
 void llama_set_dflash_dspark(struct llama_context * ctx, bool enabled);
+// Toggle the DSpark confidence-head output in the draft graph (drops the cached graph on change).
+void llama_set_dflash_dspark_conf(struct llama_context * ctx, bool enabled);
+// Copy the per-position confidences of the last draft decode; returns the number copied (0 = none).
+int32_t llama_copy_dflash_draft_conf(struct llama_context * ctx, float * out, int32_t capacity);
 
 int32_t llama_model_dflash_block_size(const struct llama_model * model);
 int32_t llama_model_dflash_mask_token_id(const struct llama_model * model);
@@ -87,6 +91,7 @@ int32_t llama_model_dflash_n_target_features(const struct llama_model * model);
 int32_t llama_model_dflash_target_layer_ids(const struct llama_model * model, int32_t * layer_ids, int32_t capacity);
 int32_t llama_model_dflash_target_mask_token_id(const struct llama_model * model);
 bool llama_model_dflash_has_dspark_head(const struct llama_model * model);
+bool llama_model_dflash_has_dspark_conf(const struct llama_model * model);
 
 enum llama_dflash_io_mode {
     LLAMA_DFLASH_IO_MODE_INVALID = 0,

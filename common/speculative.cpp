@@ -1134,6 +1134,8 @@ static common_params_speculative common_speculative_get_runtime_params(
     result.n_min = stage.has_n_min_override() ? stage.n_min : params.n_min;
     result.p_min = stage.has_p_min_override() ? stage.p_min : params.p_min;
     result.mtp_heads = stage.has_mtp_heads_override() ? stage.mtp_heads : params.mtp_heads;
+    result.conf_min = stage.has_conf_min_override() ? stage.conf_min : params.conf_min;
+    result.conf_cum_min = stage.has_conf_cum_min_override() ? stage.conf_cum_min : params.conf_cum_min;
     result.draft_temperature = params.draft_temperature;
     result.draft_seed = params.draft_seed;
 

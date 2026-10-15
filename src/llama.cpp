@@ -27,6 +27,7 @@
 #include "llama-moe-cache.h"
 #include "llama-expert-place.h"
 #include "llama-spec-features.h"
+#include "llama-spec-features-dflash.h"
 #include "llama-dflash.h"
 #include "llama-dsv4.h"
 #include "llama-quantize.h"
@@ -7806,6 +7807,7 @@ static int llama_decode_internal(
         //}
 
         lctx.dflash.draft_tokens.clear();
+        lctx.dflash.draft_conf.clear();
         lctx.dflash.draft_lattice.clear();
         lctx.dflash.draft_lattice_ids.clear();
         if (lctx.dflash.draft_tokens_tensor != nullptr) {
@@ -7818,6 +7820,18 @@ static int llama_decode_internal(
                     lctx.dflash.draft_tokens_tensor,
                     lctx.dflash.draft_tokens.data(), 0,
                     (size_t) n_tokens_argmax * sizeof(int32_t));
+            }
+        }
+        if (lctx.dflash.draft_conf_tensor != nullptr) {
+            ggml_backend_t backend_conf = ggml_backend_sched_get_tensor_backend(
+                lctx.sched, lctx.dflash.draft_conf_tensor);
+            if (backend_conf != nullptr) {
+                const int64_t n_conf = ggml_nelements(lctx.dflash.draft_conf_tensor);
+                lctx.dflash.draft_conf.resize((size_t) n_conf);
+                ggml_backend_tensor_get_async(backend_conf,
+                    lctx.dflash.draft_conf_tensor,
+                    lctx.dflash.draft_conf.data(), 0,
+                    (size_t) n_conf * sizeof(float));
             }
         }
 
@@ -13413,6 +13427,17 @@ float * llama_get_logits_ith(struct llama_context * ctx, int32_t i) {
 #endif
         return nullptr;
     }
+}
+
+// defined here because llama_context::Prev is complete only in this file
+void llama_set_dflash_dspark_conf(struct llama_context * ctx, bool enabled) {
+    if (ctx == nullptr || ctx->dflash.dspark_conf == enabled) {
+        return;
+    }
+    ctx->dflash.dspark_conf = enabled;
+    // the reusable graph was built with the other setting
+    ctx->prev.reset();
+    ctx->prev_mtp.reset();
 }
 
 llama_token llama_get_dflash_draft_token_ith(struct llama_context * ctx, int32_t i) {

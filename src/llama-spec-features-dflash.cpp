@@ -84,6 +84,16 @@ void llama_set_dflash_dspark(struct llama_context * ctx, bool enabled) {
     }
 }
 
+int32_t llama_copy_dflash_draft_conf(struct llama_context * ctx, float * out, int32_t capacity) {
+    if (ctx == nullptr || out == nullptr || capacity <= 0) {
+        return 0;
+    }
+    llama_synchronize(ctx);
+    const int32_t n = std::min<int32_t>(capacity, (int32_t) ctx->dflash.draft_conf.size());
+    std::copy(ctx->dflash.draft_conf.begin(), ctx->dflash.draft_conf.begin() + n, out);
+    return n;
+}
+
 int32_t llama_model_dflash_block_size(const struct llama_model * model) {
     return model ? (int32_t) model->hparams.dflash_block_size : 0;
 }
@@ -128,6 +138,10 @@ bool llama_model_dflash_has_dspark_head(const struct llama_model * model) {
     return model != nullptr &&
         model->dspark_markov_w1 != nullptr &&
         model->dspark_markov_w2 != nullptr;
+}
+
+bool llama_model_dflash_has_dspark_conf(const struct llama_model * model) {
+    return llama_model_dflash_has_dspark_head(model) && model->dspark_conf_proj != nullptr;
 }
 
 static const ggml_tensor * llama_dflash_output_tensor(

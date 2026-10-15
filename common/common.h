@@ -191,6 +191,8 @@ struct common_speculative_stage_params {
     int32_t n_min = -1;
     float   p_min = -1.0f;
     int32_t mtp_heads = -1;
+    float   conf_min = -1.0f;     // DSpark: stop the draft at the first position with confidence < conf_min
+    float   conf_cum_min = -1.0f; // DSpark: stop the draft once the product of confidences < conf_cum_min
 
     uint16_t ngram_size_n = 0;
     uint16_t ngram_size_m = 0;
@@ -204,6 +206,8 @@ struct common_speculative_stage_params {
     bool has_n_min_override() const { return n_min >= 0; }
     bool has_p_min_override() const { return p_min >= 0.0f; }
     bool has_mtp_heads_override() const { return mtp_heads >= 0; }
+    bool has_conf_min_override() const { return conf_min >= 0.0f; }
+    bool has_conf_cum_min_override() const { return conf_cum_min >= 0.0f; }
     bool has_ngram_size_n_override() const { return ngram_size_n > 0; }
     bool has_ngram_size_m_override() const { return ngram_size_m > 0; }
     bool has_ngram_min_hits_override() const { return ngram_min_hits > 0; }
@@ -244,6 +248,11 @@ struct common_params_speculative {
 
     float   p_split = 0.1f; // speculative decoding split probability
     float   p_min = 0.75f; // minimum speculative decoding probability (greedy)
+
+    // DSpark confidence-scheduled truncation (0 = off). The draft's trained confidence head gives c_k,
+    // the probability that draft token k survives verification given the earlier ones did.
+    float   conf_min = 0.0f;     // truncate at the first k with c_k < conf_min
+    float   conf_cum_min = 0.0f; // truncate at the first k with c_0 * ... * c_k < conf_cum_min
 
     // ngram-based speculative decoding
 
