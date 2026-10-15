@@ -459,6 +459,7 @@ struct gpt_params {
     int  dsa_top_k         = -1;    // DSA top-k override (<0 => use the model's configured indexer_top_k)
     int  min_experts       = -1;
     float thresh_experts   = 0;
+    int  ser_max_batch     = 0;     // SER only for batches of <= this many tokens (0 = all)
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool ignore_eos        = false; // ignore generated EOS tokens

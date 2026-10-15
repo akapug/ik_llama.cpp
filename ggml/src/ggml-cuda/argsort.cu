@@ -18,7 +18,9 @@ struct store_ser {
     constexpr static bool has_thresh = true;
     int   min_experts;
     float thresh_experts;
-    store_ser(int min, float thresh) : min_experts(min), thresh_experts(thresh) {}
+    const float * w = nullptr; // optional: threshold on w (e.g. unbiased routing probs) instead of the sort key
+    int   wk = 0;              // max of w is taken over the top wk entries
+    store_ser(int min, float thresh, const float * w_ = nullptr, int wk_ = 0) : min_experts(min), thresh_experts(thresh), w(w_), wk(wk_) {}
 };
 
 struct store {
@@ -77,12 +79,23 @@ static __global__ void k_argsort_f32_T(const float * x, dst_t * dst, const int n
 
     if constexpr (Store::has_thresh) {
         __syncthreads();
-        float max_val = x_row[dst_row[0]];
+        const float * t_row = s.w ? s.w + row * ncols : x_row;
+        float max_val = t_row[dst_row[0]];
+        if (s.w) { // uniform over the block
+            float * smax = (float *)(dst_row + ncols_pad);
+            if (col == 0) {
+                for (int c = 1; c < s.wk; ++c) max_val = fmaxf(max_val, t_row[dst_row[c]]);
+                *smax = max_val;
+            }
+            __syncthreads();
+            max_val = *smax;
+        }
         if (col < ntop) {
+            const bool keep = col < s.min_experts || t_row[dst_row[col]] >= s.thresh_experts*max_val;
             if constexpr (std::is_same_v<dst_t, int>) {
-                dst[row * ntop + col] = col < s.min_experts || x_row[dst_row[col]] >= s.thresh_experts*max_val ? dst_row[col] : -1;
+                dst[row * ntop + col] = keep ? dst_row[col] : -1;
             } else {
-                dst[row * ntop + col] = col < s.min_experts || x_row[dst_row[col]] >= s.thresh_experts*max_val ? x_row[dst_row[col]] : 0.f;
+                dst[row * ntop + col] = keep ? x_row[dst_row[col]] : 0.f;
             }
         }
     } else {
@@ -302,13 +315,14 @@ static int next_power_of_2(int x) {
 
 template <typename dst_t>
 static void argsort_f32_T_cuda(const float * x, dst_t * dst, const int ncols, const int nrows, int ntop,
-        ggml_sort_order order, int min_experts, float thresh_experts, cudaStream_t stream) {
+        ggml_sort_order order, int min_experts, float thresh_experts, cudaStream_t stream,
+        const float * w = nullptr, int wk = 0) {
     // bitonic sort requires ncols to be power of 2
     const int ncols_pad = next_power_of_2(ncols);
 
     const dim3 block_dims(ncols_pad, 1, 1);
     const dim3 block_nums(nrows, 1, 1);
-    const size_t shared_mem = ncols_pad * sizeof(int);
+    const size_t shared_mem = ncols_pad * sizeof(int) + (w ? sizeof(float) : 0);
 
     // FIXME: this limit could be raised by ~2-4x on Ampere or newer
     GGML_ASSERT(shared_mem <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
@@ -316,14 +330,14 @@ static void argsort_f32_T_cuda(const float * x, dst_t * dst, const int ncols, co
     if (order == GGML_SORT_ORDER_ASC) {
         if (min_experts >= 0 && min_experts < ncols && thresh_experts > 0) {
             k_argsort_f32_T<GGML_SORT_ORDER_ASC, store_ser><<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad,
-                    ntop, {min_experts, thresh_experts});
+                    ntop, store_ser(min_experts, thresh_experts, w, wk));
         } else {
             k_argsort_f32_T<GGML_SORT_ORDER_ASC, store><<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad, ntop, {});
         }
     } else if (order == GGML_SORT_ORDER_DESC) {
         if (min_experts >= 0 && min_experts < ncols && thresh_experts > 0) {
             k_argsort_f32_T<GGML_SORT_ORDER_DESC, store_ser><<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad,
-                    ntop, {min_experts, thresh_experts});
+                    ntop, store_ser(min_experts, thresh_experts, w, wk));
         } else {
             k_argsort_f32_T<GGML_SORT_ORDER_DESC, store><<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad, ntop, {});
         }
@@ -642,7 +656,13 @@ void ggml_cuda_op_argsort_thresh(ggml_backend_cuda_context & ctx, ggml_tensor * 
     float thresh;
     memcpy(&thresh, dst->op_params + 1, sizeof(float));
 
-    argsort_f32_T_cuda(src0_d, (int *)dst_d, ncols, nrows, ncols, GGML_SORT_ORDER_DESC, min_experts, thresh, stream);
+    const ggml_tensor * w = dst->src[1]; // optional threshold values (ggml_top_k_thresh_w)
+    if (w) {
+        GGML_ASSERT(w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_are_same_shape(src0, w));
+    }
+    const int wk = w ? (dst->op_params[2] < 1 ? 1 : dst->op_params[2] > ncols ? (int)ncols : dst->op_params[2]) : 0;
+    argsort_f32_T_cuda(src0_d, (int *)dst_d, ncols, nrows, ncols, GGML_SORT_ORDER_DESC, min_experts, thresh, stream,
+            w ? (const float *)w->data : nullptr, wk);
 }
 
 static void ggml_cuda_op_topk_sum(ggml_backend_cuda_context & ctx, const float * src, const float * bias, float * src_p, float * dst,

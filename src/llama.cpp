@@ -8909,6 +8909,7 @@ struct llama_context_params llama_context_default_params() {
         /*.dsa_top_k                   =*/ -1,
         /*.min_experts                 =*/ -1,
         /*.thtesh_experts              =*/ 0.0f,
+        /*.ser_max_batch               =*/ 0,
         /*.only_active_experts         =*/ false,
         /*.prefetch_experts            =*/ false,
         /*.prefetch_experts_threads    =*/ 0,
@@ -9459,6 +9460,7 @@ struct llama_context * llama_init_from_model(
     cparams.scheduler_async  = params.scheduler_async;
     cparams.min_experts      = params.min_experts;
     cparams.thresh_experts   = params.thresh_experts;
+    cparams.ser_max_batch    = params.ser_max_batch;
     cparams.cuda_params      = params.cuda_params;
     cparams.mtp              = params.mtp;
     cparams.moe_cache_size   = params.moe_cache_size;
@@ -9625,7 +9627,7 @@ struct llama_context * llama_init_from_model(
     //LLAMA_LOG_INFO("%s: split_mode_f16= %d\n",     __func__, cparams.split_mode_f16);
     LLAMA_LOG_INFO("%s: reduce_type   = %s\n",     __func__, ggml_type_name(cparams.reduce_type));
     LLAMA_LOG_INFO("%s: sched_async   = %d\n",     __func__, cparams.scheduler_async);
-    LLAMA_LOG_INFO("%s: ser           = %d, %g\n", __func__, cparams.min_experts, cparams.thresh_experts);
+    LLAMA_LOG_INFO("%s: ser           = %d, %g, max_batch %d\n", __func__, cparams.min_experts, cparams.thresh_experts, cparams.ser_max_batch);
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n",   __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",     __func__, cparams.rope_freq_scale);
     if (cparams.cuda_params) {
@@ -9818,6 +9820,25 @@ struct llama_context * llama_init_from_model(
             return nullptr;
         }
         ctx->backends.push_back(ctx->backend_cpu);
+
+        // SER (-ser Kmin,t) drops experts by writing expert id -1. Only the CPU and CUDA kernels skip -1
+        // ids (argsort_thresh, get_rows, mul_mat_id, mul_multi_add); other backends (SYCL, Vulkan, Metal,
+        // CANN, RPC) would fall back to CPU for argsort_thresh and then index with -1. Disable SER there.
+        if (cparams.min_experts > 0 && cparams.thresh_experts > 0) {
+            for (auto * backend : ctx->backends) {
+                bool ser_ok = ggml_backend_is_cpu(backend);
+#if defined(GGML_USE_CUDA)
+                ser_ok = ser_ok || ggml_backend_is_cuda(backend);
+#endif
+                if (!ser_ok) {
+                    LLAMA_LOG_WARN("%s: -ser %d,%g disabled: backend %s does not support dropped experts (CPU and CUDA only)\n",
+                            __func__, cparams.min_experts, cparams.thresh_experts, ggml_backend_name(backend));
+                    cparams.min_experts = -1;
+                    cparams.thresh_experts = 0;
+                    break;
+                }
+            }
+        }
 
         if (params.cpu_affinity != NULL && params.n_cpu_affinity > 0) {
             llama_set_cpu_affinity(ctx, params.cpu_affinity, params.n_cpu_affinity);

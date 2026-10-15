@@ -53,6 +53,7 @@ struct llama_cparams {
     bool scheduler_async;
     int  min_experts;
     float thresh_experts;
+    int  ser_max_batch;  // SER only for batches of <= this many tokens (<= 0: all batches)
     size_t moe_cache_size = 0;
     bool mtp;
     int  worst_graph_tokens;
