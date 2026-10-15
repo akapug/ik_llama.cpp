@@ -84,11 +84,14 @@ static __global__ void mul_multi_add_f32(int nused, int64_t ne0, int64_t ne1, in
     auto c0 = src0 + i1*nb02;
     auto c1 = src1 + i1*nb12;
 
+    // scales may be null (SER without down_exps_s); ids[j] < 0 = slot dropped by SER, its row was not computed
     float sum = 0;
     for (int j = 0; j < nused; ++j) {
         auto x0 = (const float *)c0;
         auto x1 = (const float *)c1;
-        sum += x0[i0] * x1[0] * scales[ids[j]];
+        if (ids[j] >= 0) {
+            sum += scales ? x0[i0] * x1[0] * scales[ids[j]] : x0[i0] * x1[0];
+        }
         c0 += nb01;
         c1 += nb11;
     }
@@ -118,13 +121,14 @@ void ggml_cuda_op_mul_multi_add(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     auto src2 = dst->src[2];
     auto src3 = dst->src[3];
-    if (src2 && src3) {
+    if (src3) {
         GGML_ASSERT(src3->ne[0] == src0->ne[1]);
         GGML_ASSERT(src3->type == GGML_TYPE_I32);
-        GGML_ASSERT(src2->type == GGML_TYPE_F32);
+        GGML_ASSERT(!src2 || src2->type == GGML_TYPE_F32);
 
         mul_multi_add_f32_cuda(src0->ne[1], dst->ne[0], dst->ne[1], dst->nb[1], src0->nb[1], src0->nb[2], src1->nb[1], src1->nb[2], src3->nb[1],
-                (const char *)src0->data, (const char *)src1->data, (char *)dst->data, (const float *)src2->data, (const char *)src3->data, ctx.stream());
+                (const char *)src0->data, (const char *)src1->data, (char *)dst->data, src2 ? (const float *)src2->data : nullptr,
+                (const char *)src3->data, ctx.stream());
 
         return;
     }

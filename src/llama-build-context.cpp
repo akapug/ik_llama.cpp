@@ -1599,16 +1599,33 @@ llm_expert_gating_func_type   gating_op,
         selection_probs = logits;
     }
 
+    // Smart Expert Reduction (SER, PR #239; call site was commented out by #840): with -ser Kmin,t the
+    // top Kmin experts are always used, and each further top-k expert only if its selection prob is
+    // >= t * the top selection prob (biased probs when exp_probs_b is present, as in #239). A dropped
+    // slot gets expert id -1. Not applied to: hash-routed layers (selected_experts passed in), grouped
+    // routing, the GPU expert cache (asserts ids >= 0), expert biases (add_id reads bias[id]), llama4
+    // (weights applied before the FFN), softmax-after-top-k gating (a dropped slot would enter the
+    // softmax as logit 0). With SER the weighted sum always goes through mul_multi_add
+    // with the ids attached, which skips -1 slots (their expert rows are not computed on every backend).
+    const bool grouped_routing = lctx.cparams.grouped_expert_routing &&
+            (lctx.model.arch == LLM_ARCH_BAILINGMOE2 || lctx.model.arch == LLM_ARCH_BAILINGMOE3);
+    const bool use_ser = selected_experts == nullptr && !grouped_routing &&
+            gating_op != LLM_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT &&
+            lctx.cparams.min_experts > 0 && lctx.cparams.thresh_experts > 0 &&
+            lctx.cparams.min_experts < n_expert_used &&
+            !weight_before_ffn && !lctx.moe_cache &&
+            !up_exps_b && !gate_exps_b && !down_exps_b && !up_gate_exps_b;
+    const bool use_mmad = lctx.cparams.fused_mmad || use_ser;
+
     // select experts
     if (selected_experts == nullptr) {
-        const bool grouped_routing = lctx.cparams.grouped_expert_routing &&
-                (lctx.model.arch == LLM_ARCH_BAILINGMOE2 || lctx.model.arch == LLM_ARCH_BAILINGMOE3);
         if (grouped_routing && n_tokens > 0) {
             auto& hparams = lctx.model.hparams;
             selected_experts = ggml_grouped_topk(ctx, selection_probs, hparams.n_expert_groups, hparams.n_group_used, 2, n_expert_used);
+        } else if (use_ser) {
+            selected_experts = ggml_top_k_thresh(ctx, selection_probs, n_expert_used,
+                    lctx.cparams.min_experts, lctx.cparams.thresh_experts); // [n_expert_used, n_tokens], -1 = dropped
         } else {
-            //selected_experts = ggml_top_k_thresh(ctx, selection_probs, n_expert_used,
-            //        lctx.cparams.min_experts, lctx.cparams.thresh_experts); // [n_expert_used, n_tokens]
             selected_experts = ggml_top_k(ctx, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
         }
     }
@@ -1802,7 +1819,7 @@ llm_expert_gating_func_type   gating_op,
         cb(experts, "ffn_moe_down_biased", il);
     }
 
-    if (down_exps_s && !lctx.cparams.fused_mmad) {
+    if (down_exps_s && !use_mmad) {
         GGML_ASSERT(!weight_before_ffn);
         auto s = ggml_reshape_3d(ctx, down_exps_s, 1, n_expert, 1);
         s = ggml_repeat_4d(ctx, s, 1, n_expert, n_tokens, 1);
@@ -1814,11 +1831,14 @@ llm_expert_gating_func_type   gating_op,
     }
 
     if (!weight_before_ffn) {
-        if (lctx.cparams.fused_mmad) {
+        if (use_mmad) {
             experts = ggml_mul_multi_add(ctx, experts, weights);
             cb(experts, "ffn_moe_weighted", il);
             if (down_exps_s) {
                 experts->src[2] = down_exps_s;
+                experts->src[3] = selected_experts;
+            } else if (use_ser) {
+                // SER: ids without scales; mul_multi_add skips slots whose id is -1
                 experts->src[3] = selected_experts;
             }
             if (add_input) {
