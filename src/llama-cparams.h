@@ -51,8 +51,9 @@ struct llama_cparams {
     bool split_mode_graph_scheduling;
     //bool split_mode_f16;
     bool scheduler_async;
-    int  min_experts = -1;       // SER (-ser Kmin,t): always keep the top Kmin routed experts
-    float thresh_experts = 0.0f; // SER: keep further top-k experts only if p >= t * p_top (0 = off)
+    int  min_experts;
+    float thresh_experts;
+    int  ser_max_batch;  // SER only for batches of <= this many tokens (<= 0: all batches)
     size_t moe_cache_size = 0;
     bool mtp;
     int  worst_graph_tokens;

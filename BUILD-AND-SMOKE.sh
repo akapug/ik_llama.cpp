@@ -63,17 +63,27 @@ if [ -f "$PPL_TEXT" ]; then
 fi
 
 # ---- (c) DeepSeek V4 (arch deepseek4) ----
-cat <<EOF
+cat <<EOT
 
-DeepSeek V4 check (all routed layers go through llm_build_moe_ffn; hash-routed layers keep their fixed ids):
- 1. load log must show:  llama_init_from_model: ser           = Kmin, t
- 2. decode speed, same harness as the optane arms (stock vs SER, same binary):
+DeepSeek V4 check (all routed layers go through llm_build_moe_ffn; the 3 hash-routed layers keep their fixed ids):
+ - load log must show:  llama_init_from_model: ser = Kmin, t, max_batch N
+ - t compares UNBIASED sqrt_softplus weights (V4 adds a near-constant bias of ~8-13 to scores of O(1),
+   so a threshold on biased scores only fired at t~1). Top-6 weights are flat: the 6th is typically
+   ~0.82-0.88 of the top (synthetic-input estimate from the real gate weights), so useful t is 0.75-0.9;
+   t<=0.6 almost never drops. Expected drops per token (estimate): t=0.8 ~0.2-1, t=0.85 ~1-2, t=0.9 ~2+ (capped by Kmin).
+ - use --ser-max-batch 1 with mmap first-touch arms: otherwise the warm-up prefill already runs with SER,
+   touches fewer experts, and the measured decodes page-fault on the rest (P9 4,1: resident 123.6 vs
+   143.4 GiB, gen0 10.46 -> gen2 12.44 tok/s). With max_batch 1 prefill/warm-up uses all 6 experts.
+ - decode speed, same harness as the optane arms (same binary for every arm):
       S=$PWD/$B/bin/llama-server ~/srv-arm.sh ser-stock
-      S=$PWD/$B/bin/llama-server ~/srv-arm.sh ser-5-04  -ser 5,0.4
-      S=$PWD/$B/bin/llama-server ~/srv-arm.sh ser-4-02  -ser 4,0.2
-      S=$PWD/$B/bin/llama-server ~/srv-arm.sh ser-4-04  -ser 4,0.4
-      S=$PWD/$B/bin/llama-server ~/srv-arm.sh ser-4-1   -ser 4,1     # = fixed k=4; compare with the override-kv k=4 run (12.8 tok/s)
- 3. quality: PPL ratio vs stock on the same text (SER error = PPL(ser)/PPL(stock) - 1; #239 found <~1% at good settings):
-      $PWD/$B/bin/llama-perplexity -m <v4.gguf> -ngl 99 -ot exps=CPU -fa 1 -t 16 -c 512 -f ~/a5-corpus.txt --chunks 20 [-ser 5,0.4]
- 4. read gen*.json text for coherence (no repeated garbage, no NaN-driven '!!!!').
-EOF
+      S=$PWD/$B/bin/llama-server ~/srv-arm.sh ser-k4    --override-kv deepseek4.expert_used_count=int:4   # control on THIS layout
+      S=$PWD/$B/bin/llama-server ~/srv-arm.sh ser-4-1   -ser 4,1    --ser-max-batch 1   # should match the k4 control
+      S=$PWD/$B/bin/llama-server ~/srv-arm.sh ser-4-085 -ser 4,0.85 --ser-max-batch 1
+      S=$PWD/$B/bin/llama-server ~/srv-arm.sh ser-4-08  -ser 4,0.8  --ser-max-batch 1
+      S=$PWD/$B/bin/llama-server ~/srv-arm.sh ser-5-085 -ser 5,0.85 --ser-max-batch 1
+      S=$PWD/$B/bin/llama-server ~/srv-arm.sh ser-4-09  -ser 4,0.9  --ser-max-batch 1
+ - quality: PPL ratio vs stock on the same text (no --ser-max-batch here, so prefill uses SER):
+      $PWD/$B/bin/llama-perplexity -m <v4.gguf> -ngl 99 -ot exps=CPU -fa 1 -t 16 -c 512 -f ~/a5b-corpus.txt --chunks 20 [-ser 4,0.85]
+   a ratio of 1.000002 vs stock means the threshold never fired.
+ - read gen*.json text for coherence (no repeated garbage, no NaN-driven '!!!!').
+EOT

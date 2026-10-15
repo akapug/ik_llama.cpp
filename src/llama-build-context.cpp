@@ -1600,9 +1600,14 @@ llm_expert_gating_func_type   gating_op,
     }
 
     // Smart Expert Reduction (SER, PR #239; call site was commented out by #840): with -ser Kmin,t the
-    // top Kmin experts are always used, and each further top-k expert only if its selection prob is
-    // >= t * the top selection prob (biased probs when exp_probs_b is present, as in #239). A dropped
-    // slot gets expert id -1. Not applied to: hash-routed layers (selected_experts passed in), grouped
+    // top Kmin experts (by selection score) are always used, and each further top-k expert only if its prob is
+    // >= t * the largest routing weight among the top-k. The threshold uses the UNBIASED probs: the
+    // selection bias (exp_probs_b) only steers which experts are picked, the unbiased prob is the
+    // expert's contribution weight, which is what #239's "small relative to the top expert" means
+    // (#239 targeted softmax gating without a bias, where both are the same). DeepSeek V4 biases are a
+    // near-constant ~8-13 added to sqrt_softplus probs of O(1), so a threshold on biased scores could
+    // only fire at t ~ 1. --ser-max-batch N limits SER to batches of <= N tokens. A dropped slot gets
+    // expert id -1. Not applied to: hash-routed layers (selected_experts passed in), grouped
     // routing, the GPU expert cache (asserts ids >= 0), expert biases (add_id reads bias[id]), llama4
     // (weights applied before the FFN), softmax-after-top-k gating (a dropped slot would enter the
     // softmax as logit 0). With SER the weighted sum always goes through mul_multi_add
@@ -1613,6 +1618,7 @@ llm_expert_gating_func_type   gating_op,
             gating_op != LLM_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT &&
             lctx.cparams.min_experts > 0 && lctx.cparams.thresh_experts > 0 &&
             lctx.cparams.min_experts < n_expert_used &&
+            (lctx.cparams.ser_max_batch <= 0 || n_tokens <= lctx.cparams.ser_max_batch) &&
             !weight_before_ffn && !lctx.moe_cache &&
             !up_exps_b && !gate_exps_b && !down_exps_b && !up_gate_exps_b;
     const bool use_mmad = lctx.cparams.fused_mmad || use_ser;
@@ -1623,8 +1629,11 @@ llm_expert_gating_func_type   gating_op,
             auto& hparams = lctx.model.hparams;
             selected_experts = ggml_grouped_topk(ctx, selection_probs, hparams.n_expert_groups, hparams.n_group_used, 2, n_expert_used);
         } else if (use_ser) {
-            selected_experts = ggml_top_k_thresh(ctx, selection_probs, n_expert_used,
-                    lctx.cparams.min_experts, lctx.cparams.thresh_experts); // [n_expert_used, n_tokens], -1 = dropped
+            selected_experts = selection_probs != probs
+                ? ggml_top_k_thresh_w(ctx, selection_probs, probs, n_expert_used,
+                        lctx.cparams.min_experts, lctx.cparams.thresh_experts)
+                : ggml_top_k_thresh(ctx, selection_probs, n_expert_used,
+                        lctx.cparams.min_experts, lctx.cparams.thresh_experts); // [n_expert_used, n_tokens], -1 = dropped
         } else {
             selected_experts = ggml_top_k(ctx, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
         }
