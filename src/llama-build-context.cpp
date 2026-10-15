@@ -1610,14 +1610,16 @@ llm_expert_gating_func_type   gating_op,
     // expert id -1. Not applied to: hash-routed layers (selected_experts passed in), grouped
     // routing, the GPU expert cache (asserts ids >= 0), expert biases (add_id reads bias[id]), llama4
     // (weights applied before the FFN), softmax-after-top-k gating (a dropped slot would enter the
-    // softmax as logit 0). With SER the weighted sum always goes through mul_multi_add
+    // softmax as logit 0), and graphs that use every expert (n_expert_used == n_expert): the startup
+    // warm-up sets n_expert_used = n_expert so it touches all experts, and SER must not cut that.
+    // With SER the weighted sum always goes through mul_multi_add
     // with the ids attached, which skips -1 slots (their expert rows are not computed on every backend).
     const bool grouped_routing = lctx.cparams.grouped_expert_routing &&
             (lctx.model.arch == LLM_ARCH_BAILINGMOE2 || lctx.model.arch == LLM_ARCH_BAILINGMOE3);
     const bool use_ser = selected_experts == nullptr && !grouped_routing &&
             gating_op != LLM_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT &&
             lctx.cparams.min_experts > 0 && lctx.cparams.thresh_experts > 0 &&
-            lctx.cparams.min_experts < n_expert_used &&
+            lctx.cparams.min_experts < n_expert_used && n_expert_used < n_expert &&
             (lctx.cparams.ser_max_batch <= 0 || n_tokens <= lctx.cparams.ser_max_batch) &&
             !weight_before_ffn && !lctx.moe_cache &&
             !up_exps_b && !gate_exps_b && !down_exps_b && !up_gate_exps_b;

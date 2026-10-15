@@ -71,9 +71,13 @@ DeepSeek V4 check (all routed layers go through llm_build_moe_ffn; the 3 hash-ro
    so a threshold on biased scores only fired at t~1). Top-6 weights are flat: the 6th is typically
    ~0.82-0.88 of the top (synthetic-input estimate from the real gate weights), so useful t is 0.75-0.9;
    t<=0.6 almost never drops. Expected drops per token (estimate): t=0.8 ~0.2-1, t=0.85 ~1-2, t=0.9 ~2+ (capped by Kmin).
- - use --ser-max-batch 1 with mmap first-touch arms: otherwise the warm-up prefill already runs with SER,
-   touches fewer experts, and the measured decodes page-fault on the rest (P9 4,1: resident 123.6 vs
-   143.4 GiB, gen0 10.46 -> gen2 12.44 tok/s). With max_batch 1 prefill/warm-up uses all 6 experts.
+ - the startup warm-up (one BOS token, n_expert_used = all 256 experts) never uses SER since this
+   commit; in 91e16e55/70a303a1 it did (-ser 4,1 kept 4 of 256), which likely explains the P9 4,1
+   first-touch deficit (resident 123.6 vs 143.4 GiB, gen0 10.46 -> gen2 12.44 tok/s). Unverified.
+ - --ser-max-batch 1 additionally keeps multi-token prompt prefill at the full top-6 (same experts
+   paged in as stock), so only single-token decode steps drop experts. Use it for the speed arms.
+ - SER is CPU + CUDA only: with any other backend in the context (SYCL, Vulkan, Metal, CANN, RPC) the
+   log says "-ser ... disabled" and the arm runs stock. Check the log line on every arm.
  - decode speed, same harness as the optane arms (same binary for every arm):
       S=$PWD/$B/bin/llama-server ~/srv-arm.sh ser-stock
       S=$PWD/$B/bin/llama-server ~/srv-arm.sh ser-k4    --override-kv deepseek4.expert_used_count=int:4   # control on THIS layout
