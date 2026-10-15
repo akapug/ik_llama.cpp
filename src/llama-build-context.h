@@ -538,6 +538,12 @@ struct llm_build_context {
             ggml_tensor * base_logits, ggml_tensor * input_tokens,
             ggml_tensor ** draft_tokens = nullptr);
 
+    // DSpark confidence head: sigmoid(conf_proj([hidden_k ; markov_w1[x_{k-1}]]) + b) per draft position.
+    // Returns F32 [1, n_tokens], or nullptr when the draft has no usable conf_proj.
+    static ggml_tensor * build_dspark_confidence(llm_build_context & llm,
+            ggml_tensor * head_hidden, ggml_tensor * input_tokens,
+            ggml_tensor * draft_tokens);
+
     static ggml_tensor * llm_build_moe_ffn(ggml_context * ctx, llama_context & lctx,
          ggml_tensor * cur,
          ggml_tensor * gate_inp,   ggml_tensor * gate_inp_b,

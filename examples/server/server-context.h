@@ -166,6 +166,7 @@ struct server_slot {
     // speculative decoding stats
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
+    int32_t n_draft_rounds = 0;     // Draft attempts, including ones that came back empty
     std::vector<int32_t> n_draft_by_depth;
     std::vector<int32_t> n_draft_accepted_by_depth;
 

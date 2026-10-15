@@ -171,6 +171,12 @@ common_params_speculative common_params_speculative::with_stage_overrides(const 
     if (stage.has_mtp_heads_override()) {
         result.mtp_heads = stage.mtp_heads;
     }
+    if (stage.has_conf_min_override()) {
+        result.conf_min = stage.conf_min;
+    }
+    if (stage.has_conf_cum_min_override()) {
+        result.conf_cum_min = stage.conf_cum_min;
+    }
     if (stage.has_ngram_size_n_override()) {
         result.ngram_size_n = stage.ngram_size_n;
         result.ngram_mod.reset();
@@ -1148,6 +1154,17 @@ static void common_speculative_stage_apply_kv(
         if (stage.mtp_heads < 0) {
             throw std::invalid_argument("speculative stage mtp_heads must be >= 0");
         }
+        return;
+    }
+    if (key == "conf_min" || key == "conf_cum_min") {
+        if (stage.type != COMMON_SPECULATIVE_TYPE_DSPARK) {
+            throw std::invalid_argument("speculative stage " + key + " applies only to dspark stages");
+        }
+        const float value = std::stof(value_raw);
+        if (!(value >= 0.0f && value <= 1.0f)) {
+            throw std::invalid_argument("speculative stage " + key + " must be within [0, 1]");
+        }
+        (key == "conf_min" ? stage.conf_min : stage.conf_cum_min) = value;
         return;
     }
     if (key == "ngram_size_n") {
@@ -3667,12 +3684,15 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                               "  --recurrent-ckpt-mode remains as a deprecated alias" });
     options.push_back({ "*", "--spec-type SPEC[:k=v,...]",      "canonical speculative stage entry; repeat for a supported two-stage chain.\n"
                                                               "types: none, draft, dflash, dspark, mtp, ngram-cache, ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod, suffix\n"
-                                                              "canonical keys: n_max,n_min,p_min,heads,ngram_size_n,ngram_size_m,ngram_min_hits,suffix_min_match_len,suffix_max_depth,suffix_corpus\n"
+                                                              "canonical keys: n_max,n_min,p_min,heads,ngram_size_n,ngram_size_m,ngram_min_hits,suffix_min_match_len,suffix_max_depth,suffix_corpus,conf_min,conf_cum_min\n"
+                                                              "dspark conf_min / conf_cum_min (0..1, default 0 = off): truncate the draft at the first position whose\n"
+                                                              "  confidence-head score (conf_min) or running product of scores (conf_cum_min) falls below the value\n"
                                                               "MTP heads: heads=1 is the default; heads>1 and heads=0 (all model heads) are experimental\n"
                                                               "for comma-bearing string values, quote the value inside the stage payload for normal shell use\n"
                                                               "if argv is passed directly without shell unescaping, the parser also accepts escaped commas as \\,\n"
                                                               "examples: --spec-type mtp:n_max=1,p_min=0.0\n"
                                                               "          --model-draft draft.gguf --spec-type dflash:n_max=4\n"
+                                                              "          --model-draft dspark.gguf --spec-type dspark:n_max=5,conf_cum_min=0.3\n"
                                                               "          --spec-type ngram-mod:n_max=64,n_min=2,ngram_size_n=8 --spec-type mtp:n_max=1,p_min=0.0\n"
                                                               "          --spec-type \"suffix:n_max=16,n_min=2,suffix_min_match_len=5,suffix_max_depth=64,suffix_corpus='/tmp/spec,type-corpus.json'\"\n"
                                                               "legacy --spec-stage, --draft-*, --spec-ngram-*, --suffix-* and -mtp flags are rejected" });
