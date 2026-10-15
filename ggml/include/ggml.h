@@ -2506,6 +2506,15 @@ extern "C" {
             int                   k,
             int                   min_entries,
             float                 thresh);
+    // as ggml_top_k_thresh, but rank by a and threshold on w (same shape, e.g. unbiased routing probs):
+    // keep rank < min_entries, else keep if w >= thresh * max(w over the top k)
+    GGML_API struct ggml_tensor * ggml_top_k_thresh_w(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * w,
+            int                   k,
+            int                   min_entries,
+            float                 thresh);
     GGML_API struct ggml_tensor * ggml_grouped_topk(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

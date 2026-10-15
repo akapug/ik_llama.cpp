@@ -50,7 +50,7 @@ static __global__ void mmq_ids_helper(
             int iex_used = -1; // The index at which the expert is used, if any.
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
                 const int expert_used = ids[it*si1 + iex];
-                nex_prev += expert_used < expert;
+                nex_prev += expert_used >= 0 && expert_used < expert; // SER: -1 = dropped slot, not a column
                 if (expert_used == expert) {
                     iex_used = iex;
                 }
@@ -75,7 +75,7 @@ static __global__ void mmq_ids_helper(
             const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
                 ids[it*si1 + iex] : INT_MAX;
             const int iex_used = expert_used == expert ? iex : -1;
-            nex_prev += expert_used < expert;
+            nex_prev += expert_used >= 0 && expert_used < expert; // SER: -1 = dropped slot, not a column
 
             // Whether the threads at this token position have used the expert:
             const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
@@ -107,6 +107,15 @@ static __global__ void mmq_ids_helper(
         const int iex_used = store_it.iex_used();
         ids_src1[nex_prev + itc] = it*sis1          + iex_used % nchannels_y;
         ids_dst [nex_prev + itc] = it*n_expert_used + iex_used;
+    }
+
+    // SER: dropped (-1) slots are not columns, so the compact range ends before n_tokens*n_expert_used.
+    // The src1 quantization still walks all n_tokens*n_expert_used entries of ids_src1: point the
+    // unused tail at row 0 so it stays in bounds. Empty without -1 ids.
+    if (expert == gridDim.x - 1) {
+        for (int i = nex_prev + it_compact + threadIdx.x; i < n_tokens*n_expert_used; i += warp_size) {
+            ids_src1[i] = 0;
+        }
     }
 
     if (threadIdx.x != 0) {
