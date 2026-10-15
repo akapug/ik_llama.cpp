@@ -28988,6 +28988,19 @@ typedef int ggml_lock_t;
 
 #endif
 
+// Linux affinity
+#if defined(__gnu_linux__)
+// GGML_AFFINITY_ONCE=1 (research): each OS thread applies its affinity once and keeps it, instead of setaffinity on every
+// graph compute (one per backend split, many per token) plus widening/restoring the main thread after each compute.
+static int ggml_affinity_once(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_AFFINITY_ONCE"); v = e && atoi(e) != 0; }
+    return v;
+}
+static __thread int g_numa_affinity_done = 0;
+static __thread int g_pinned_cpu = -1;
+#endif
+
 // Android's libc implementation "bionic" does not support setting affinity
 #if defined(__gnu_linux__)
 static void set_numa_thread_affinity(int thread_n) {
@@ -29010,6 +29023,8 @@ static void set_numa_thread_affinity(int thread_n) {
             break;
         case GGML_NUMA_STRATEGY_NUMACTL:
             // use the cpuset that numactl gave us
+            if (ggml_affinity_once() && g_numa_affinity_done) return;
+            g_numa_affinity_done = 1;
             rv = pthread_setaffinity_np(pthread_self(), setsize, &g_state.numa.cpuset);
             if (rv) {
                 fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n",strerror(rv));
@@ -29038,6 +29053,9 @@ static void set_numa_thread_affinity(int thread_n) {
 static void clear_numa_thread_affinity(void) {
     if (!ggml_is_numa()) {
         return;
+    }
+    if (ggml_affinity_once()) {
+        return; // keep this thread's affinity (with NUMACTL it is numactl's own cpuset)
     }
 
     size_t setsize = CPU_ALLOC_SIZE(g_state.numa.total_cpus);
@@ -29075,6 +29093,11 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
     if (cpu < 0 || cpu >= CPU_SETSIZE) {
         return;
     }
+
+    if (ggml_affinity_once() && g_pinned_cpu == cpu) {
+        return;
+    }
+    g_pinned_cpu = cpu;
 
     cpu_set_t mask;
     CPU_ZERO(&mask);
@@ -29648,7 +29671,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 #if defined(__gnu_linux__)
     // the calling thread is worker 0 and gets pinned below; remember its affinity
     cpu_set_t saved_affinity;
-    const bool restore_affinity =
+    const bool restore_affinity = !ggml_affinity_once() &&
         cplan->cpu_affinity != NULL && cplan->n_cpu_affinity > 0 &&
         pthread_getaffinity_np(pthread_self(), sizeof(saved_affinity), &saved_affinity) == 0;
 #endif

@@ -1626,6 +1626,36 @@ llm_expert_gating_func_type   gating_op,
             !up_exps_b && !gate_exps_b && !down_exps_b && !up_gate_exps_b;
     const bool use_mmad = lctx.cparams.fused_mmad || use_ser;
 
+    // Union cap for speculative verify (LLAMA_UNION_CAP=U[,G], research): the tokens of one group may route only to the
+    // U experts with the largest summed selection score over the group, so a verify batch reads at most U distinct experts
+    // instead of up to G*k (CPU expert cost grows ~linearly with distinct experts). Without G the whole batch is one group
+    // when 2 <= n_tokens <= 8 (decode verify); with G, consecutive groups of G tokens (n_tokens % G == 0), so llama-perplexity
+    // can measure the capped model's KLD. Only GPU-capable ops, so no extra backend split per layer.
+    if (selected_experts == nullptr && !grouped_routing && n_tokens > 1 && n_expert_used < n_expert) {
+        static const std::pair<int, int> ucap = [] {
+            const char * e = getenv("LLAMA_UNION_CAP");
+            int u = 0, g = 0;
+            if (e && *e && sscanf(e, "%d,%d", &u, &g) >= 1) {
+                fprintf(stderr, "%s: LLAMA_UNION_CAP U=%d G=%d\n", __func__, u, g);
+            }
+            return std::make_pair(u, g);
+        }();
+        const int U = ucap.first;
+        const int G = ucap.second > 0 ? ucap.second : (n_tokens <= 8 ? (int) n_tokens : 0);
+        if (U >= n_expert_used && U < n_expert && G > 1 && n_tokens % G == 0) {
+            const int64_t ng = n_tokens / G;
+            ggml_tensor * s3 = ggml_reshape_3d(ctx, ggml_cont(ctx, selection_probs), n_expert, G, ng);
+            ggml_tensor * score = ggml_sum_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, s3, 1, 0, 2, 3)));        // [1, n_expert, ng]
+            ggml_tensor * ids = ggml_cont(ctx, ggml_top_k(ctx, ggml_reshape_2d(ctx, score, n_expert, ng), U + 1)); // [U+1, ng]
+            ggml_tensor * vals = ggml_get_rows(ctx, score, ids);                                                 // [1, U+1, ng]
+            ggml_tensor * thr = ggml_cont(ctx, ggml_view_3d(ctx, vals, 1, 1, ng, vals->nb[1], vals->nb[2], U*vals->nb[1]));
+            ggml_tensor * keep = ggml_step(ctx, ggml_sub(ctx, score, thr));                                      // 1 = in the top U
+            keep = ggml_reshape_3d(ctx, keep, n_expert, 1, ng);
+            selection_probs = ggml_reshape_2d(ctx, ggml_add(ctx, s3, ggml_scale(ctx, keep, 1e4f)), n_expert, n_tokens);
+            cb(selection_probs, "ffn_moe_probs_union", il);
+        }
+    }
+
     // select experts
     if (selected_experts == nullptr) {
         if (grouped_routing && n_tokens > 0) {
