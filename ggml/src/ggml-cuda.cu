@@ -64,6 +64,7 @@
 #include "ggml-cuda/blend.cuh"
 #include "ggml-cuda/indexer_topk.cuh"
 #include "ggml-cuda/ds4_comp.cuh"
+#include "ggml-cuda/pin-budget.h"
 
 #include <algorithm>
 #include <array>
@@ -1440,12 +1441,18 @@ GGML_CALL static const char * ggml_backend_cuda_host_buffer_name(ggml_backend_bu
 // upload staging) even when GGML_CUDA_NO_PINNED is set. GGML_CUDA_NO_PINNED still keeps the CPU-side weights mmapped
 // (llama-load-tensors reads it), so the pinned set is only the small per-step buffers. Allocations above
 // GGML_CUDA_PIN_STAGING_MAX_MIB (default 4096) stay pageable so a weight buffer is never pinned by accident.
+// With --no-mmap the weights arrive as many chunks below that limit, so the running total is capped as well:
+// GGML_CUDA_PIN_MAX_MIB (default 25 % of MemAvailable at the first pinned request; ggml-cuda/pin-budget.h).
+static bool ggml_cuda_pin_staging_on() {
+    static const bool pin_staging = getenv("GGML_CUDA_PIN_STAGING") != nullptr && atoi(getenv("GGML_CUDA_PIN_STAGING")) != 0;
+    return pin_staging && getenv("GGML_CUDA_NO_PINNED") != nullptr;
+}
+
 static bool ggml_cuda_pinned_refused(size_t size) {
     if (getenv("GGML_CUDA_NO_PINNED") == nullptr) {
         return false;
     }
-    static const bool pin_staging = getenv("GGML_CUDA_PIN_STAGING") != nullptr && atoi(getenv("GGML_CUDA_PIN_STAGING")) != 0;
-    if (!pin_staging) {
+    if (!ggml_cuda_pin_staging_on()) {
         return true;
     }
     static const size_t max_bytes = [] {
@@ -1454,22 +1461,61 @@ static bool ggml_cuda_pinned_refused(size_t size) {
         return (size_t) std::max(0ll, v) << 20;
     }();
     const bool refused = size > max_bytes;
-    if (size >= ((size_t) 64 << 20) || refused) {
-        GGML_CUDA_LOG_INFO("%s: GGML_CUDA_PIN_STAGING %s %.2f MiB\n", __func__, refused ? "left pageable" : "pinned",
-                size / 1024.0 / 1024.0);
+    if (refused) {
+        GGML_CUDA_LOG_INFO("%s: GGML_CUDA_PIN_STAGING left pageable %.2f MiB (above GGML_CUDA_PIN_STAGING_MAX_MIB)\n",
+                __func__, size / 1024.0 / 1024.0);
     }
     return refused;
 }
 
 #ifdef __linux__
+static ggml_cuda_pin_budget::budget & ggml_cuda_pin_budget_get() {
+    static ggml_cuda_pin_budget::budget b(ggml_cuda_pin_budget::cap_bytes_from_system(getenv("GGML_CUDA_PIN_MAX_MIB")));
+    return b;
+}
+
+// PIN_STAGING path only: reserve size in the total budget. A refusal is logged once and the caller falls back to
+// pageable memory.
+static bool ggml_cuda_pin_budget_reserve(size_t size) {
+    auto & b = ggml_cuda_pin_budget_get();
+    if (!b.try_reserve(size)) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            GGML_CUDA_LOG_INFO("%s: GGML_CUDA_PIN_MAX_MIB cap %.2f MiB reached: %.2f MiB request left pageable with "
+                               "%.2f MiB pinned in %zu buffers; further requests that do not fit stay pageable\n",
+                               __func__, b.cap / 1024.0 / 1024.0, size / 1024.0 / 1024.0,
+                               b.total() / 1024.0 / 1024.0, b.count.load());
+        }
+        return false;
+    }
+    if (size >= ((size_t) 64 << 20)) {
+        GGML_CUDA_LOG_INFO("%s: GGML_CUDA_PIN_STAGING pinned %.2f MiB (total %.2f of %.2f MiB)\n", __func__,
+                           size / 1024.0 / 1024.0, b.total() / 1024.0 / 1024.0, b.cap / 1024.0 / 1024.0);
+    }
+    return true;
+}
+
 GGML_CALL static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     CUDA_CHECK(cudaHostUnregister(buffer->context));
     munmap(buffer->context, buffer->size);
 }
 
-static void * ggml_cuda_host_malloc(size_t size) {
+GGML_CALL static void ggml_backend_cuda_host_buffer_free_budgeted_buffer(ggml_backend_buffer_t buffer) {
+    ggml_backend_cuda_host_buffer_free_buffer(buffer);
+    ggml_cuda_pin_budget_get().release(buffer->size);
+}
+
+// *budgeted = true when the allocation holds a share of the GGML_CUDA_PIN_MAX_MIB budget (released on free)
+static void * ggml_cuda_host_malloc(size_t size, bool * budgeted) {
+    *budgeted = false;
     if (ggml_cuda_pinned_refused(size)) {
         return nullptr;
+    }
+    if (ggml_cuda_pin_staging_on()) {
+        if (!ggml_cuda_pin_budget_reserve(size)) {
+            return nullptr;
+        }
+        *budgeted = true;
     }
 
     constexpr double k_warn_limit = 8.0;
@@ -1485,6 +1531,10 @@ static void * ggml_cuda_host_malloc(size_t size) {
     void * ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (ptr == MAP_FAILED) {
         GGML_CUDA_LOG_WARN("%s: mmap of %.2f MiB failed\n", __func__, size/1024.0/1024.0);
+        if (*budgeted) {
+            ggml_cuda_pin_budget_get().release(size);
+            *budgeted = false;
+        }
         return nullptr;
     }
 
@@ -1518,6 +1568,10 @@ static void * ggml_cuda_host_malloc(size_t size) {
         GGML_CUDA_LOG_WARN("%s: cudaHostRegister of %.2f MiB failed: %s\n", __func__,
                            size/1024.0/1024.0, cudaGetErrorString(err));
         munmap(ptr, size);
+        if (*budgeted) {
+            ggml_cuda_pin_budget_get().release(size);
+            *budgeted = false;
+        }
         return nullptr;
     }
 
@@ -1543,7 +1597,8 @@ static size_t ggml_cuda_pinned_cap() {
     return cap;
 }
 
-static void * ggml_cuda_host_malloc(size_t size) {
+static void * ggml_cuda_host_malloc(size_t size, bool * budgeted) {
+    *budgeted = false; // this path keeps its own GGML_CUDA_PINNED_CAP_GIB total
     if (ggml_cuda_pinned_refused(size)) {
         return nullptr;
     }
@@ -1614,7 +1669,8 @@ GGML_CALL static size_t ggml_backend_cuda_host_buffer_type_get_max_size(ggml_bac
 }
 
 GGML_CALL static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    void * ptr = ggml_cuda_host_malloc(size);
+    bool budgeted = false;
+    void * ptr = ggml_cuda_host_malloc(size, &budgeted);
 
     if (ptr == nullptr) {
         // fallback to cpu buffer
@@ -1630,6 +1686,11 @@ GGML_CALL static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_
     buffer->buft = buft;
     buffer->iface.get_name = ggml_backend_cuda_host_buffer_name;
     buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
+#ifdef __linux__
+    if (budgeted) {
+        buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_budgeted_buffer;
+    }
+#endif
 
     return buffer;
 }
