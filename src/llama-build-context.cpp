@@ -135,6 +135,7 @@ void llm_build_context::init() {
         lctx.dsv4.inputs.raw_k_write_src_idxs = nullptr;
         lctx.dsv4.inputs.raw_k_write_idxs = nullptr;
         lctx.dsv4.inputs.raw_k_read_idxs = nullptr;
+        lctx.dsv4.inputs.raw_kq_mask = nullptr;
         lctx.dsv4.inputs.csa = {};
         lctx.dsv4.inputs.hca = {};
         lctx.dsv4.inputs.lid = {};
@@ -2970,6 +2971,38 @@ struct ggml_cgraph * llm_build_context::llama_build_graph_dflash_kv_cache(llama_
     return result;
 }
 
+// Debug aid (LLAMA_CHECK_CUDA_CONCAT=1): report every CONCAT node the CUDA backend would abort on
+// (ggml-cuda/concat.cu: any type for a plain copy or a dim-0 concat of 4-byte-aligned rows, else F32
+// only), so a CPU run catches graphs that only crash on CUDA.
+static void llm_check_cuda_concats(ggml_cgraph * gf) {
+    static const bool enabled = getenv("LLAMA_CHECK_CUDA_CONCAT") != nullptr;
+    if (!enabled) {
+        return;
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * t = ggml_graph_node(gf, i);
+        if (t->op != GGML_OP_CONCAT) {
+            continue;
+        }
+        const ggml_tensor * a = t->src[0];
+        const ggml_tensor * b = t->src[1];
+        const int32_t dim = ((const int32_t *) t->op_params)[0];
+        const size_t ts = ggml_type_size(t->type);
+        const bool same = a->type == b->type && a->type == t->type;
+        const bool copy = ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
+            (dim == 3 || (dim == 2 && t->ne[3] == 1) || (dim == 1 && t->ne[2]*t->ne[3] == 1));
+        const bool rows = dim == 0 && a->nb[0] == ts && b->nb[0] == ts &&
+            a->nb[1] % 4 == 0 && b->nb[1] % 4 == 0 && (a->ne[0]*ts) % 4 == 0 && (b->ne[0]*ts) % 4 == 0;
+        if (same && (copy || rows || t->type == GGML_TYPE_F32)) {
+            continue;
+        }
+        fprintf(stderr, "CUDA-UNSUPPORTED concat %s (%s) dim %d: %s [%ld %ld %ld %ld]%s + %s [%ld %ld %ld %ld]%s\n",
+                t->name, ggml_type_name(t->type), dim,
+                a->name, a->ne[0], a->ne[1], a->ne[2], a->ne[3], ggml_is_contiguous(a) ? "" : " non-contiguous",
+                b->name, b->ne[0], b->ne[1], b->ne[2], b->ne[3], ggml_is_contiguous(b) ? "" : " non-contiguous");
+    }
+}
+
 ggml_cgraph * llm_build_context::llama_build_graph(
          llama_context & lctx,
      const llama_batch & batch,
@@ -3384,6 +3417,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
     }
 
     result->n_batch = llm.n_tokens;
+
+    if (llm_arch_is_dsv4(model.arch)) {
+        llm_check_cuda_concats(result);
+    }
 
     // add on pooling layer
     if (lctx.cparams.mtp_op_type == MTP_OP_NONE && (lctx.cparams.embeddings ||
