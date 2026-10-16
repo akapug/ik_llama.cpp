@@ -1404,6 +1404,18 @@ static bool dsv4_per_step_copy_base(llama_context & ctx, bool restore) {
     return true;
 }
 
+// n consecutive rows of t from row first, as a standalone 2-d tensor header (one copy moves all n rows)
+static ggml_tensor dsv4_rows_view(const ggml_tensor & t, int64_t first, int64_t n) {
+    ggml_tensor v = t;
+    v.ne[1] = n;
+    v.ne[2] = v.ne[3] = 1;
+    v.nb[2] = v.nb[3] = v.nb[1]*n;
+    v.data = (char *) t.data + (size_t) first*t.nb[1];
+    v.view_src = nullptr;
+    v.view_offs = 0;
+    return v;
+}
+
 static bool dsv4_per_step_capture_group(
         llama_context & ctx,
         const std::vector<ggml_tensor *> & states,
@@ -1444,9 +1456,11 @@ static bool dsv4_per_step_capture_group(
             return false;
         }
 
-        for (size_t row = 0; row < plan.state_delta_src_idxs.size(); ++row) {
-            const int32_t src_idx = plan.state_delta_src_idxs[row];
-            const int32_t dst_idx = plan.state_delta_dst_idxs[row];
+        const auto & src_idxs = plan.state_delta_src_idxs;
+        const auto & dst_idxs = plan.state_delta_dst_idxs;
+        for (size_t row = 0; row < src_idxs.size(); ++row) {
+            const int32_t src_idx = src_idxs[row];
+            const int32_t dst_idx = dst_idxs[row];
             if (src_idx < 0 || (uint64_t) src_idx >= (uint64_t) delta->ne[1] ||
                 dst_idx < 0 || (uint64_t) dst_idx >= (uint64_t) state->ne[1]) {
                 return false;
@@ -1454,22 +1468,21 @@ static bool dsv4_per_step_capture_group(
             if (rows != nullptr && (uint64_t) src_idx >= (uint64_t) rows->ne[1]) {
                 return false;
             }
+        }
 
-            ggml_tensor src_view = rows != nullptr ? *rows : *state;
-            ggml_tensor dst_view = *delta;
-            src_view.ne[1] = src_view.ne[2] = src_view.ne[3] = 1;
-            dst_view.ne[1] = dst_view.ne[2] = dst_view.ne[3] = 1;
-            src_view.nb[2] = src_view.nb[3] = src_view.nb[1];
-            dst_view.nb[2] = dst_view.nb[3] = dst_view.nb[1];
-            src_view.data = rows != nullptr
-                    ? (char *) rows->data + (size_t) src_idx * rows->nb[1]
-                    : (char *) state->data + (size_t) dst_idx * state->nb[1];
-            dst_view.data = (char *) delta->data + (size_t) src_idx * delta->nb[1];
-            src_view.view_src = nullptr;
-            dst_view.view_src = nullptr;
-            src_view.view_offs = 0;
-            dst_view.view_offs = 0;
+        // One copy per run of consecutive token rows (from the ring: also consecutive slots), not one per token.
+        for (size_t row = 0; row < src_idxs.size(); ) {
+            size_t n = 1;
+            while (row + n < src_idxs.size() && src_idxs[row + n] == src_idxs[row] + (int32_t) n &&
+                   (rows != nullptr || dst_idxs[row + n] == dst_idxs[row] + (int32_t) n)) {
+                ++n;
+            }
+            ggml_tensor src_view = rows != nullptr
+                    ? dsv4_rows_view(*rows, src_idxs[row], (int64_t) n)
+                    : dsv4_rows_view(*state, dst_idxs[row], (int64_t) n);
+            ggml_tensor dst_view = dsv4_rows_view(*delta, src_idxs[row], (int64_t) n);
             ggml_backend_tensor_copy_async(rows != nullptr ? rows_backend : backend, backend, &src_view, &dst_view);
+            row += n;
         }
     }
 
@@ -1669,6 +1682,23 @@ bool llama_dsv4_spec_ckpt_save(llama_context * ctx, bool use_gpu) {
     return true;
 }
 
+// The visible rows (batch order) that are the last writer of their slot, in batch order.
+static std::vector<size_t> dsv4_per_step_restore_winners(
+        const std::vector<int32_t> & dst_idxs, const std::vector<size_t> & visible, int32_t max_dst) {
+    std::vector<int64_t> winner((size_t) (max_dst + 1), -1);
+    for (size_t row : visible) {
+        const int32_t dst = dst_idxs[row];
+        winner[(size_t) dst] = (int64_t) row;
+    }
+    std::vector<size_t> winners;
+    for (size_t row : visible) {
+        if (winner[(size_t) dst_idxs[row]] == (int64_t) row) {
+            winners.push_back(row);
+        }
+    }
+    return winners;
+}
+
 static enum llama_spec_ckpt_restore_result dsv4_per_step_restore_rows(
         llama_context & ctx,
         const std::vector<ggml_tensor *> & states,
@@ -1687,6 +1717,25 @@ static enum llama_spec_ckpt_restore_result dsv4_per_step_restore_rows(
         return LLAMA_SPEC_CKPT_RESTORE_FAILED;
     }
 
+    // Rows of tokens up to the accepted step, in batch order. Replaying them in that order leaves, per slot, the last
+    // writer; copy only those rows.
+    std::vector<size_t> visible;
+    int32_t max_dst = -1;
+    for (size_t row = 0; row < src_idxs.size(); ++row) {
+        if (src_idxs[row] > accepted_step) {
+            continue;
+        }
+        // Reject invalid mappings instead of leaving stale compressor state.
+        if (src_idxs[row] < 0 || dst_idxs[row] < 0) {
+            LLAMA_LOG_ERROR("%s: invalid visible DSV4 state row src=%d dst=%d accepted_step=%d\n",
+                    __func__, src_idxs[row], dst_idxs[row], accepted_step);
+            return LLAMA_SPEC_CKPT_RESTORE_FAILED;
+        }
+        visible.push_back(row);
+        max_dst = std::max(max_dst, dst_idxs[row]);
+    }
+    const std::vector<size_t> winners = dsv4_per_step_restore_winners(dst_idxs, visible, max_dst);
+
     for (size_t i = 0; i < states.size(); ++i) {
         ggml_tensor * state = states[i];
         ggml_tensor * delta = deltas[delta_offset + i];
@@ -1697,35 +1746,29 @@ static enum llama_spec_ckpt_restore_result dsv4_per_step_restore_rows(
         if (backend == nullptr && (state->buffer == nullptr || delta->buffer == nullptr)) {
             return LLAMA_SPEC_CKPT_RESTORE_FAILED;
         }
+        if (max_dst >= 0 && (uint64_t) max_dst >= (uint64_t) state->ne[1]) {
+            LLAMA_LOG_ERROR("%s: invalid visible DSV4 state row dst=%d accepted_step=%d state_rows=%lld\n",
+                    __func__, max_dst, accepted_step, (long long) state->ne[1]);
+            return LLAMA_SPEC_CKPT_RESTORE_FAILED;
+        }
 
-        for (size_t row = 0; row < src_idxs.size(); ++row) {
-            if (src_idxs[row] > accepted_step) {
-                continue;
+        // One copy per run of winners with consecutive delta rows and consecutive slots.
+        for (size_t w = 0; w < winners.size(); ) {
+            const size_t row = winners[w];
+            size_t n = 1;
+            while (w + n < winners.size() &&
+                   src_idxs[winners[w + n]] == src_idxs[row] + (int32_t) n &&
+                   dst_idxs[winners[w + n]] == dst_idxs[row] + (int32_t) n) {
+                ++n;
             }
-            // Reject invalid mappings instead of leaving stale compressor state.
-            if (src_idxs[row] < 0 || dst_idxs[row] < 0 ||
-                (uint64_t) dst_idxs[row] >= (uint64_t) state->ne[1]) {
-                LLAMA_LOG_ERROR("%s: invalid visible DSV4 state row src=%d dst=%d accepted_step=%d state_rows=%lld\n",
-                        __func__, src_idxs[row], dst_idxs[row], accepted_step, (long long) state->ne[1]);
-                return LLAMA_SPEC_CKPT_RESTORE_FAILED;
-            }
-            ggml_tensor src_view = *delta;
-            ggml_tensor dst_view = *state;
-            src_view.ne[1] = src_view.ne[2] = src_view.ne[3] = 1;
-            dst_view.ne[1] = dst_view.ne[2] = dst_view.ne[3] = 1;
-            src_view.nb[2] = src_view.nb[3] = src_view.nb[1];
-            dst_view.nb[2] = dst_view.nb[3] = dst_view.nb[1];
-            src_view.data = (char *) delta->data + (size_t) src_idxs[row] * delta->nb[1];
-            dst_view.data = (char *) state->data + (size_t) dst_idxs[row] * state->nb[1];
-            src_view.view_src = nullptr;
-            dst_view.view_src = nullptr;
-            src_view.view_offs = 0;
-            dst_view.view_offs = 0;
+            ggml_tensor src_view = dsv4_rows_view(*delta, src_idxs[row], (int64_t) n);
+            ggml_tensor dst_view = dsv4_rows_view(*state, dst_idxs[row], (int64_t) n);
             if (backend != nullptr) {
                 ggml_backend_tensor_copy_async(backend, backend, &src_view, &dst_view);
             } else {
                 ggml_backend_tensor_copy(&src_view, &dst_view);
             }
+            w += n;
         }
         if (backend != nullptr && std::find(backends.begin(), backends.end(), backend) == backends.end()) {
             backends.push_back(backend);
