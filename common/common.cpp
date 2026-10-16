@@ -337,8 +337,9 @@ bool common_speculative_validate_chain(const common_params_speculative & params,
             return fail("two-stage speculative mode currently requires a self-spec stage first");
         }
 
-        if (second != COMMON_SPECULATIVE_TYPE_MTP && second != COMMON_SPECULATIVE_TYPE_DRAFT) {
-            return fail("two-stage speculative mode currently supports only MTP or draft-model fallback after self-spec");
+        if (second != COMMON_SPECULATIVE_TYPE_MTP && second != COMMON_SPECULATIVE_TYPE_DRAFT &&
+                !common_speculative_type_is_dflash_family(second)) {
+            return fail("two-stage speculative mode currently supports only MTP, DFlash/DSpark or draft-model fallback after self-spec");
         }
     }
 
