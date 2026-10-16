@@ -379,7 +379,14 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
         std::string key, ids;
         ss >> key >> ids;
         const int il = parse_layer_key(key);
-        if (il < 0 || il >= (int) model.layers.size() || ids.empty()) {
+        if (il >= (int) model.layers.size() && !ids.empty()) {
+            // the file names a layer this model lacks: it was written for another model (e.g. the target, while this
+            // context loads a small speculative draft that reads the same env) -> no hot set for this model
+            LLAMA_LOG_WARN("llama_hot_experts: %s:%d names blk.%d but this model has %d layers; hot experts inactive for this model\n",
+                path, ln, il, (int) model.layers.size());
+            return nullptr;
+        }
+        if (il < 0 || ids.empty()) {
             throw std::runtime_error(std::string(path) + ":" + std::to_string(ln) + ": expected 'blk.N<TAB>expert,list'");
         }
         auto & v = hot[il];
