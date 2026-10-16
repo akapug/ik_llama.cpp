@@ -4939,8 +4939,13 @@ static inline void ggml_barrier_impl(struct ggml_compute_state_shared * shared) 
 //  GGML_MOE_GROUPS=G[,C]   routed-expert matmuls (MUL_MAT_ID, MOE_FUSED_UP_GATE; builds without GGML_EXPERT_CHUNKING):
 //                          threads form G contiguous groups (G=2 with -cr 0-19 = one group per socket); group g owns
 //                          the same contiguous row range the static split gives its threads (so first-touch pages
-//                          stay local) and splits it into C chunks (default 2 x threads per group) that its threads
-//                          take from a shared counter, so a slow or late thread no longer holds up the whole step.
+//                          stay local) and splits it into C chunks (default: threads per group, i.e. the static
+//                          split's own slices, bit-identical results) that its threads take from a shared counter,
+//                          so a slow or late thread no longer holds up the whole step.
+//  GGML_MAIN_NO_MOE=1      with GGML_MOE_GROUPS: thread 0 (the calling thread, which in a hybrid GPU run also issues
+//                          every CUDA launch/copy/sync) takes no routed-expert chunks and does not quantize the
+//                          activations, so its core runs no dense AVX-512 and need not drop to the AVX-512 clock
+//                          license for the host work between CPU splits; its group's other threads take its rows.
 struct ggml_cpu_knobs {
     int    barrier_spin;
     int    fast_entry;
@@ -4948,6 +4953,7 @@ struct ggml_cpu_knobs {
     int    stats;
     int    moe_groups;
     int    moe_chunks;
+    int    main_no_moe;
 };
 static struct ggml_cpu_knobs g_cpu_knobs;
 static atomic_int g_cpu_knobs_init = 0;
@@ -4962,6 +4968,7 @@ static const struct ggml_cpu_knobs * ggml_get_cpu_knobs(void) {
         k.stats        = (e = getenv("GGML_CPU_STATS"))      ? atoi(e) : 0;
         k.moe_groups = 0;
         k.moe_chunks = 0;
+        k.main_no_moe  = (e = getenv("GGML_MAIN_NO_MOE"))    ? atoi(e) != 0 : 0;
         if ((e = getenv("GGML_MOE_GROUPS")) != NULL) {
             int g = 0, c = 0;
             if (sscanf(e, "%d,%d", &g, &c) >= 1 && g >= 1) {
@@ -4969,9 +4976,14 @@ static const struct ggml_cpu_knobs * ggml_get_cpu_knobs(void) {
                 k.moe_chunks = MAX(c, 0);
             }
         }
+        if (k.main_no_moe && !k.moe_groups) {
+            fprintf(stderr, "ggml cpu knobs: GGML_MAIN_NO_MOE needs GGML_MOE_GROUPS (its rows go to its group); ignored\n");
+            k.main_no_moe = 0;
+        }
         if (k.barrier_spin || k.fast_entry || k.serial_small || k.stats || k.moe_groups) {
             fprintf(stderr, "ggml cpu knobs: GGML_BARRIER_SPIN=%d GGML_OMP_FAST_ENTRY=%d GGML_SERIAL_SMALL=%zu GGML_CPU_STATS=%d "
-                    "GGML_MOE_GROUPS=%d,%d\n", k.barrier_spin, k.fast_entry, k.serial_small, k.stats, k.moe_groups, k.moe_chunks);
+                    "GGML_MOE_GROUPS=%d,%d GGML_MAIN_NO_MOE=%d\n", k.barrier_spin, k.fast_entry, k.serial_small, k.stats,
+                    k.moe_groups, k.moe_chunks, k.main_no_moe);
         }
         g_cpu_knobs = k; // identical values if two threads race here
         atomic_store_explicit(&g_cpu_knobs_init, 1, memory_order_release);
@@ -18682,6 +18694,7 @@ static int ggml_compute_forward_mul_mat(
 // static split (up to one slice of rounding), which keeps first-touch NUMA placement local.
 struct ggml_moe_group_iter {
     int g, G, C;
+    bool skip; // GGML_MAIN_NO_MOE: this is thread 0 and its group has other threads to take its chunks
     int last_a, last_acc; // fetch_add values only grow per thread, so the expert walk resumes where it stopped
 };
 
@@ -18692,10 +18705,20 @@ static bool ggml_moe_group_init(const struct ggml_compute_params * params, struc
     const int G = MIN(g_cpu_knobs.moe_groups, params->nth);
     it->G = G;
     it->g = params->ith * G / params->nth;
-    it->C = g_cpu_knobs.moe_chunks > 0 ? g_cpu_knobs.moe_chunks : 2*((params->nth + G - 1) / G);
+    // default: G*C == nth, i.e. exactly the static split's row slices (a free thread takes a late one's whole slice).
+    // Other partitions change iqk results on some types (measured: Q6_K MoE down, KLD 0.04-0.08 vs the 8-thread split).
+    it->C = g_cpu_knobs.moe_chunks > 0 ? g_cpu_knobs.moe_chunks :
+            params->nth % G == 0 ? params->nth / G : 2*((params->nth + G - 1) / G);
     it->last_a = 0;
     it->last_acc = 0;
+    it->skip = g_cpu_knobs.main_no_moe && params->ith == 0 && (params->nth + G - 1) / G >= 2;
     return true;
+}
+
+// src1 rows are quantized by thread (i11 % nth); with GGML_MAIN_NO_MOE rotate so a decode step's single row is
+// not quantized by thread 0
+static inline int ggml_moe_src1_ith(int ith, int nth) {
+    return g_cpu_knobs.main_no_moe && g_cpu_knobs.moe_groups && nth > 1 ? (ith + nth - 1) % nth : ith;
 }
 
 static bool ggml_moe_group_next(struct ggml_compute_state_shared * shared, struct ggml_moe_group_iter * it,
@@ -18785,7 +18808,7 @@ static void ggml_compute_forward_mul_mat_id(
 
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                for (int64_t i11 = ggml_moe_src1_ith(ith, nth); i11 < ne11; i11 += nth) {
                     from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
                                (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
                                ne10);
@@ -18888,7 +18911,7 @@ IQK_MulMat_Not_Available0:;
             const void * wdata_mm    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
             const size_t row_size_mm = ggml_row_size(vec_dot_type, ne10);
             int cur_a, chunk, n_chunks;
-            while (ggml_moe_group_next(params->shared, &git, matrix_row_counts, n_as, &cur_a, &chunk, &n_chunks)) {
+            while (!git.skip && ggml_moe_group_next(params->shared, &git, matrix_row_counts, n_as, &cur_a, &chunk, &n_chunks)) {
                 if (!iqk_mul_mat_moe(ne01, matrix_row_counts[cur_a], ne00, ne11,
                             src0->type, (const char *) src0->data + cur_a*nb02, nb01,
                             vec_dot_type, (const char *)wdata_mm, row_size_mm,
@@ -19136,7 +19159,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
 
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                for (int64_t i11 = ggml_moe_src1_ith(ith, nth); i11 < ne11; i11 += nth) {
                     from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
                                (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
                                ne10);
@@ -19262,7 +19285,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
     // compute each matrix multiplication in sequence (or, with GGML_MOE_GROUPS, the chunks this thread's group hands out)
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         if (grouped) {
-            if (!ggml_moe_group_next(params->shared, &git, matrix_row_counts, n_as, &g_cur_a, &g_chunk, &g_n_chunks)) {
+            if (git.skip || !ggml_moe_group_next(params->shared, &git, matrix_row_counts, n_as, &g_cur_a, &g_chunk, &g_n_chunks)) {
                 break;
             }
             cur_a = g_cur_a;
