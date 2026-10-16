@@ -192,6 +192,13 @@ llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURC
 llama_build_and_test(test-chat-template.cpp )
 llama_build_and_test(test-json-partial.cpp )
 llama_build_and_test(test-cpu-affinity.cpp )
+
+# header-only pinned-memory budget of the CUDA backend; needs no GPU, so it builds in every configuration
+find_package(Threads REQUIRED)
+add_executable(test-cuda-pin-budget test-cuda-pin-budget.cpp)
+target_link_libraries(test-cuda-pin-budget PRIVATE Threads::Threads)
+add_test(NAME test-cuda-pin-budget COMMAND $<TARGET_FILE:test-cuda-pin-budget>)
+set_property(TEST test-cuda-pin-budget PROPERTY LABELS main)
 llama_build_and_test(test-nanbeige-loop.cpp )
 #llama_build_and_test(test-log.cpp)
 llama_build_and_test(
