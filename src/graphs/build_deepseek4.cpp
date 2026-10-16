@@ -161,6 +161,39 @@ static ggml_tensor * dsv4_new_mask_input(ggml_context * ctx, ggml_tensor ** dst,
     return *dst;
 }
 
+// The raw (SWA) keys are gathered per stream by raw_k_read_idxs, but KQ_mask_swa is indexed by cache
+// cell (n_kv = kv_self.n columns, all token rows in one block). When the two layouts differ (several
+// sequences, or a fragmented single sequence) give the graph a mask filled on the host in the gathered
+// layout, [read rows, token rows, 1, n_stream], instead of re-gathering KQ_mask_swa in every layer.
+// Filled by dsv4_set_raw_kq_mask (llama-dsv4.cpp).
+static void dsv4_new_raw_kq_mask_input(ggml_context * ctx, llama_context & lctx, int64_t n_tokens) {
+    lctx.dsv4.inputs.raw_kq_mask = nullptr;
+    const auto & raw = lctx.dsv4.raw;
+    const int64_t n_stream = (int64_t) raw.sinfo_read.n_stream();
+    const int64_t n_read = (int64_t) raw.read_dst_idxs.size();
+    if (lctx.kv_self.any_compacted() || raw.n_kv <= 0 || n_stream <= 0 || n_tokens % n_stream != 0 ||
+            n_read != GGML_PAD(raw.n_kv, 256)*n_stream) {
+        return;
+    }
+    if (lctx.cparams.n_seq_max == 1 && (int64_t) lctx.kv_self.n == n_read) {
+        // the cells are the gathered rows: KQ_mask_swa serves as is
+        return;
+    }
+    const int64_t n_rows = lctx.cparams.flash_attn ? GGML_PAD(n_tokens/n_stream, GGML_KQ_MASK_PAD) : n_tokens/n_stream;
+    lctx.dsv4.inputs.raw_kq_mask = ggml_new_tensor_4d(ctx, lctx.cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32,
+            n_read/n_stream, n_rows, 1, n_stream);
+    ggml_set_input(lctx.dsv4.inputs.raw_kq_mask);
+    ggml_set_name(lctx.dsv4.inputs.raw_kq_mask, "dsv4_raw_kq_mask");
+}
+
+// Token rows [s*n_rows, (s+1)*n_rows) of a mask: stream s of a [W, rows, 1, n_stream] mask, or a row
+// block of a [W, n_tokens] one. One stream's rows are contiguous, so the CUDA backend can concat them
+// in any type.
+static ggml_tensor * dsv4_mask_stream_rows(ggml_context * ctx, ggml_tensor * mask, int64_t s, int64_t n_rows) {
+    const size_t offset = mask->ne[3] > 1 ? (size_t) s*mask->nb[3] : (size_t) (s*n_rows)*mask->nb[1];
+    return ggml_view_2d(ctx, mask, mask->ne[0], n_rows, mask->nb[1], offset);
+}
+
 static void dsv4_build_plan_inputs(
         ggml_context * ctx,
         llama_context::dsv4_runtime::comp_inputs & inputs,
@@ -752,6 +785,77 @@ static ggml_tensor * dsv4_build_attn(
     cb(kqv, "kqv", il);
     ggml_tensor * cur = ggml_permute(ctx, kqv, 0, 2, 1, 3);
     return ggml_cont_2d(ctx, cur, cur->ne[0] * cur->ne[1], cur->ne[2] * cur->ne[3]);
+}
+
+// Attention of a multi-sequence batch (-np > 1), one call per stream (sequence). Joining the raw
+// (SWA) and compressed keys and masks one stream at a time keeps every concat a copy of contiguous
+// rows, which the CUDA backend runs in any type; the same concats over all streams at once (dim 2
+// of a 4D K, dim 1 of a 4D mask) are F32-only there and abort with an F16 cache or mask.
+static ggml_tensor * dsv4_build_attn_streams(
+        ggml_context * ctx,
+        const llama_hparams & hparams,
+        const llama_cparams & cparams,
+        ggml_tensor  * q,
+        ggml_tensor  * raw_k,
+        ggml_tensor  * extra_k,
+        ggml_tensor  * raw_mask,
+        ggml_tensor  * extra_mask,
+        ggml_tensor  * sinks,
+        float          kq_scale,
+        const llm_build_cb & cb,
+        int            il,
+        int            n_compressed,
+        ggml_cgraph  * gf) {
+    const int64_t n_stream = extra_k->ne[3];
+    GGML_ASSERT(raw_k->ne[3] == n_stream && q->ne[2] % n_stream == 0);
+    const int64_t n_tokens_stream = q->ne[2]/n_stream;
+    auto stream_k = [&](ggml_tensor * k, int64_t s) {
+        ggml_tensor * k_s = ggml_view_4d(ctx, k, k->ne[0], k->ne[1], k->ne[2], 1, k->nb[1], k->nb[2], k->nb[3], s*k->nb[3]);
+        return ggml_is_contiguous(k_s) ? k_s : ggml_cont(ctx, k_s);
+    };
+    auto stream_mask = [&](ggml_tensor * mask, int64_t s) {
+        ggml_tensor * m = dsv4_mask_stream_rows(ctx, mask, s, mask->ne[3] > 1 ? mask->ne[1] : n_tokens_stream);
+        if (!ggml_is_contiguous(m)) {
+            m = ggml_cont(ctx, m);
+        }
+        if (cparams.flash_attn) {
+            m = dsv4_pad_mask_tokens(ctx, m, n_tokens_stream);
+            if (m->type != GGML_TYPE_F16) {
+                m = ggml_cast(ctx, m, GGML_TYPE_F16);
+            }
+        }
+        return m;
+    };
+    ggml_tensor * result = nullptr;
+    for (int64_t s = 0; s < n_stream; ++s) {
+        ggml_tensor * q_s = ggml_view_3d(ctx, q, q->ne[0], q->ne[1], n_tokens_stream,
+                q->nb[1], q->nb[2], s*n_tokens_stream*q->nb[2]);
+        ggml_tensor * rk = stream_k(raw_k, s);
+        ggml_tensor * ek = stream_k(extra_k, s);
+        if (rk->type != ek->type) {
+            ek = ggml_cast(ctx, ek, rk->type);
+        }
+        ggml_tensor * rm = stream_mask(raw_mask, s);
+        ggml_tensor * em = stream_mask(extra_mask, s);
+        if (rm->type != em->type) {
+            rm = ggml_cast(ctx, rm, em->type);
+        }
+        if (rm->ne[1] != em->ne[1]) {
+            // non-FA: the masks carry exactly the stream's token rows
+            const int64_t n_rows = std::min(rm->ne[1], em->ne[1]);
+            GGML_ASSERT(n_rows >= n_tokens_stream);
+            rm = ggml_view_2d(ctx, rm, rm->ne[0], n_rows, rm->nb[1], 0);
+            em = ggml_view_2d(ctx, em, em->ne[0], n_rows, em->nb[1], 0);
+        }
+        ggml_tensor * k_all = ggml_concat(ctx, rk, ek, 2);
+        ggml_tensor * kq_mask = ggml_concat(ctx, rm, em, 0);
+        cb(k_all, "k_all_stream", il);
+        cb(kq_mask, "kq_mask_stream", il);
+        ggml_tensor * cur_s = dsv4_build_attn(ctx, hparams, cparams, q_s, k_all, k_all, kq_mask,
+                sinks, kq_scale, cb, il, n_compressed, gf);
+        result = result == nullptr ? cur_s : ggml_concat(ctx, result, cur_s, 1);
+    }
+    return result;
 }
 
 static ggml_tensor * build_hc_pre(
@@ -1397,6 +1501,9 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
     } else if (hparams.n_head_kv(il) == 1 && read_idxs != nullptr) {
         raw_k = dsv4_raw_get_k(&lctx, ctx0, kv_self.k_l[il], read_idxs, n_embd_head, cb, il);
     }
+    // the keys were gathered by raw_k_read_idxs and the host filled the mask in that layout
+    const bool raw_mask_input = !raw_compacted && raw_k != nullptr && read_idxs != nullptr &&
+        hparams.n_head_kv(il) == 1 && lctx.dsv4.inputs.raw_kq_mask != nullptr;
     if (raw_k == nullptr) {
         raw_k = ggml_view_3d(ctx0, kv_self.k_l[il],
                 n_embd_head, hparams.n_head_kv(il), n_kv,
@@ -1414,6 +1521,10 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
         : raw_kq_n_kv > 0 ? std::max<int64_t>(256, GGML_PAD(raw_kq_n_kv, 256)) : raw_kq_n_kv;
     if (!raw_compacted && raw_k->ne[3] == 1) {
         raw_k = dsv4_pad_raw_k_to(ctx0, raw_k, raw_attn_n_kv);
+    }
+    if (raw_mask_input) {
+        raw_mask = lctx.dsv4.inputs.raw_kq_mask;
+        GGML_ASSERT(raw_mask->ne[0] == raw_k->ne[2] && raw_mask->ne[3] == raw_k->ne[3]);
     }
     if (raw_mask == nullptr) {
         raw_mask = dsv4_build_raw_mask_view(llm, mask_views, KQ_mask,
@@ -1449,19 +1560,19 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
             extra_k = dsv4_comp_get_k(ctx0, cache, extra_ctx, n_embd_head, cache->ne[1]/n_stream);
             cb(extra_k, "extra_k", il);
         }
-        if (extra_k->ne[3] > 1 && ggml_is_matrix(extra_mask)) {
-            // the plain [n_kv, n_tokens] input (no top-k selection below n_kv) as per-stream rows
-            extra_mask = dsv4_build_raw_mask_view(llm, mask_views, extra_mask, nullptr,
-                    extra_mask->ne[0], n_tokens, extra_k->ne[3], cb, il);
-        }
-        if (cparams.flash_attn) {
+        const int64_t n_stream_g = extra_k->ne[3];
+        if (cparams.flash_attn && n_stream_g == 1) {
             extra_mask = dsv4_pad_mask_tokens(ctx0, extra_mask, n_tokens);
         }
-        raw_k = dsv4_repeat_streams(ctx0, raw_k, extra_k->ne[3]);
-        if (!cparams.flash_attn && !raw_compacted) {
+        raw_k = dsv4_repeat_streams(ctx0, raw_k, n_stream_g);
+        if (!cparams.flash_attn && !raw_compacted && !raw_mask_input) {
             raw_mask = dsv4_build_raw_mask_view(llm, mask_views, KQ_mask,
-                    read_idxs, raw_kq_n_kv, n_tokens, extra_k->ne[3], cb, il);
+                    read_idxs, raw_kq_n_kv, n_tokens, n_stream_g, cb, il);
             raw_mask = dsv4_pad_raw_mask_to(ctx0, raw_mask, raw_attn_n_kv, n_tokens);
+        }
+        if (n_stream_g > 1) {
+            return dsv4_build_attn_streams(ctx0, hparams, cparams, q, raw_k, extra_k, raw_mask, extra_mask,
+                    model.layers[il].attn_sinks, kq_scale, cb, il, n_swa_eff, gf);
         }
         if (!cparams.flash_attn && raw_compacted && raw_mask->ne[1] != n_tokens) {
             // non-FA masks are unpadded; drop the win mask's token padding before the concat
@@ -1639,6 +1750,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
     dsv4_new_i32_input(ctx0, &lctx.dsv4.inputs.raw_k_write_src_idxs, (int64_t) lctx.dsv4.raw.write_src_idxs.size(), "dsv4_raw_k_write_src_idxs");
     dsv4_new_i32_input(ctx0, &lctx.dsv4.inputs.raw_k_write_idxs, (int64_t) lctx.dsv4.raw.write_dst_idxs.size(), "dsv4_raw_k_write_idxs");
     dsv4_new_i32_input(ctx0, &lctx.dsv4.inputs.raw_k_read_idxs, (int64_t) lctx.dsv4.raw.read_dst_idxs.size(), "dsv4_raw_k_read_idxs");
+    dsv4_new_raw_kq_mask_input(ctx0, lctx, n_tokens);
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.csa, lctx.dsv4.csa_plan, "dsv4_csa", n_tokens, true, lctx.cparams.flash_attn);
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.hca, lctx.dsv4.hca_plan, "dsv4_hca", n_tokens, true, lctx.cparams.flash_attn);
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.lid, lctx.dsv4.lid_plan, "dsv4_lid", n_tokens, false, lctx.cparams.flash_attn);
@@ -1665,7 +1777,15 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             KQ_mask = hparams.n_swa > 0 ? build_inp_KQ_mask_swa() : build_inp_KQ_mask();
         }
     } else {
-        KQ_mask = hparams.n_swa > 0 ? build_inp_KQ_mask_swa() : build_inp_KQ_mask();
+        // with the gathered-layout raw mask (dsv4_new_raw_kq_mask_input) only a layer with several
+        // KV heads (no gathered keys) reads the cell-indexed mask
+        bool cell_mask = lctx.dsv4.inputs.raw_kq_mask == nullptr;
+        for (int il = n_layer_begin; il < n_layer_end && !cell_mask; ++il) {
+            cell_mask = hparams.n_head_kv(il) != 1;
+        }
+        if (cell_mask) {
+            KQ_mask = hparams.n_swa > 0 ? build_inp_KQ_mask_swa() : build_inp_KQ_mask();
+        }
     }
     ggml_tensor * inpL = nullptr;
 
@@ -2347,6 +2467,9 @@ static ggml_tensor * ds4_attention_v41(ggml_cgraph * gf, ggml_context * ctx0, ll
     } else if (hparams.n_head_kv(il) == 1 && read_idxs != nullptr) {
         raw_k = dsv4_raw_get_k(&lctx, ctx0, kv_self.k_l[il], read_idxs, n_embd_head, cb, il);
     }
+    // the keys were gathered by raw_k_read_idxs and the host filled the mask in that layout
+    const bool raw_mask_input = !raw_compacted && raw_k != nullptr && read_idxs != nullptr &&
+        hparams.n_head_kv(il) == 1 && lctx.dsv4.inputs.raw_kq_mask != nullptr;
     if (raw_k == nullptr) {
         raw_k = ggml_view_3d(ctx0, kv_self.k_l[il],
                 n_embd_head, hparams.n_head_kv(il), n_kv,
@@ -2364,6 +2487,10 @@ static ggml_tensor * ds4_attention_v41(ggml_cgraph * gf, ggml_context * ctx0, ll
         : raw_kq_n_kv > 0 ? std::max<int64_t>(256, GGML_PAD(raw_kq_n_kv, 256)) : raw_kq_n_kv;
     if (!raw_compacted && raw_k->ne[3] == 1) {
         raw_k = dsv4_pad_raw_k_to(ctx0, raw_k, raw_attn_n_kv);
+    }
+    if (raw_mask_input) {
+        raw_mask = lctx.dsv4.inputs.raw_kq_mask;
+        GGML_ASSERT(raw_mask->ne[0] == raw_k->ne[2] && raw_mask->ne[3] == raw_k->ne[3]);
     }
     if (raw_mask == nullptr) {
         raw_mask = dsv4_build_raw_mask_view(llm, mask_views, KQ_mask,
@@ -2403,19 +2530,19 @@ static ggml_tensor * ds4_attention_v41(ggml_cgraph * gf, ggml_context * ctx0, ll
             extra_k = dsv4_comp_get_k(ctx0, cache, extra_ctx, n_embd_head, cache->ne[1]/n_stream);
             cb(extra_k, "extra_k", il);
         }
-        if (extra_k->ne[3] > 1 && ggml_is_matrix(extra_mask)) {
-            // the plain [n_kv, n_tokens] input (no top-k selection below n_kv) as per-stream rows
-            extra_mask = dsv4_build_raw_mask_view(llm, mask_views, extra_mask, nullptr,
-                    extra_mask->ne[0], n_tokens, extra_k->ne[3], cb, il);
-        }
-        if (cparams.flash_attn) {
+        const int64_t n_stream_g = extra_k->ne[3];
+        if (cparams.flash_attn && n_stream_g == 1) {
             extra_mask = dsv4_pad_mask_tokens(ctx0, extra_mask, n_tokens);
         }
-        raw_k = dsv4_repeat_streams(ctx0, raw_k, extra_k->ne[3]);
-        if (!cparams.flash_attn && !raw_compacted) {
+        raw_k = dsv4_repeat_streams(ctx0, raw_k, n_stream_g);
+        if (!cparams.flash_attn && !raw_compacted && !raw_mask_input) {
             raw_mask = dsv4_build_raw_mask_view(llm, mask_views, KQ_mask,
-                    read_idxs, raw_kq_n_kv, n_tokens, extra_k->ne[3], cb, il);
+                    read_idxs, raw_kq_n_kv, n_tokens, n_stream_g, cb, il);
             raw_mask = dsv4_pad_raw_mask_to(ctx0, raw_mask, raw_attn_n_kv, n_tokens);
+        }
+        if (n_stream_g > 1) {
+            return dsv4_build_attn_streams(ctx0, hparams, cparams, q, raw_k, extra_k, raw_mask, extra_mask,
+                    model.layers[il].attn_sinks, kq_scale, cb, il, n_swa_eff, gf);
         }
         if (!cparams.flash_attn && raw_compacted && raw_mask->ne[1] != n_tokens) {
             raw_mask = ggml_view_2d(ctx0, raw_mask, raw_mask->ne[0], n_tokens, raw_mask->nb[1], 0);
@@ -2757,6 +2884,7 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
     dsv4_new_i32_input(ctx0, &lctx.dsv4.inputs.raw_k_write_src_idxs, (int64_t) lctx.dsv4.raw.write_src_idxs.size(), "dsv4_raw_k_write_src_idxs");
     dsv4_new_i32_input(ctx0, &lctx.dsv4.inputs.raw_k_write_idxs, (int64_t) lctx.dsv4.raw.write_dst_idxs.size(), "dsv4_raw_k_write_idxs");
     dsv4_new_i32_input(ctx0, &lctx.dsv4.inputs.raw_k_read_idxs, (int64_t) lctx.dsv4.raw.read_dst_idxs.size(), "dsv4_raw_k_read_idxs");
+    dsv4_new_raw_kq_mask_input(ctx0, lctx, n_tokens);
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.csa, lctx.dsv4.csa_plan, "dsv4_csa", n_tokens, true, lctx.cparams.flash_attn,
             hparams.dsv4_candidate_block_size, hparams.dsv4_candidate_topk_blocks);
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.hca, lctx.dsv4.hca_plan, "dsv4_hca", n_tokens, true, lctx.cparams.flash_attn,
@@ -2783,7 +2911,15 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
             KQ_mask = hparams.n_swa > 0 ? build_inp_KQ_mask_swa() : build_inp_KQ_mask();
         }
     } else {
-        KQ_mask = hparams.n_swa > 0 ? build_inp_KQ_mask_swa() : build_inp_KQ_mask();
+        // with the gathered-layout raw mask (dsv4_new_raw_kq_mask_input) only a layer with several
+        // KV heads (no gathered keys) reads the cell-indexed mask
+        bool cell_mask = lctx.dsv4.inputs.raw_kq_mask == nullptr;
+        for (int il = 0; il < n_layer_end && !cell_mask; ++il) {
+            cell_mask = hparams.n_head_kv(il) != 1;
+        }
+        if (cell_mask) {
+            KQ_mask = hparams.n_swa > 0 ? build_inp_KQ_mask_swa() : build_inp_KQ_mask();
+        }
     }
 
     ggml_tensor * append_csa_state = nullptr;
