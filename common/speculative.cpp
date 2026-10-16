@@ -1022,9 +1022,12 @@ struct common_speculative_state_suffix : public common_speculative_state {
             llama_tokens & result) override {
 
         base_p_min = params.p_min;
+        // the configured p_min is the floor; low acceptance raises it (up to 0.2 above, at least 0.5)
+        const float p_min_cap = std::min(0.99f, std::max(0.5f, base_p_min + 0.2f));
+        eff_p_min = std::max(eff_p_min, base_p_min);
         if (n_draft_last > 0 && !had_accept) {
             if (++n_low >= 3) {
-                eff_p_min = std::min(eff_p_min + 0.1f, 0.5f);
+                eff_p_min = std::min(eff_p_min + 0.1f, p_min_cap);
                 n_low     = 0;
             }
         }
@@ -1082,7 +1085,7 @@ struct common_speculative_state_suffix : public common_speculative_state {
         const double f_acc = (double)n_accepted / (double)n_draft_last;
         if (f_acc < 0.5) {
             if (++n_low >= 3) {
-                eff_p_min = std::min(eff_p_min + 0.1f, 0.5f);
+                eff_p_min = std::min(eff_p_min + 0.1f, std::min(0.99f, std::max(0.5f, base_p_min + 0.2f)));
                 n_low     = 0;
             }
         } else {
