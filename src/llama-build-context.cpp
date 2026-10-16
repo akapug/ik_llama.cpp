@@ -1520,6 +1520,14 @@ ggml_tensor * llm_build_context::llm_build_ffn(
     return cur;
 }
 
+bool llm_build_context::moe_overlap() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_MOE_OVERLAP");
+        return e && atoi(e) != 0;
+    }();
+    return on;
+}
+
 ggml_tensor * llm_build_context::llm_build_moe_ffn(
         ggml_context * ctx,
        llama_context & lctx,
@@ -1749,6 +1757,14 @@ llm_expert_gating_func_type   gating_op,
     // copy in the GPU bank run there (misses get id -1, which the CUDA decode kernels skip), the rest run
     // on the CPU from the full tensors (hits get id -1, which the CPU kernels zero-fill); the sum of the
     // two outputs equals the single-path expert output row by row.
+    // LLAMA_MOE_OVERLAP: after the routed expert matmuls are in the graph, add the side work (shared expert) and the
+    // routing weights, so they come before the combine that waits for the experts
+    const bool overlap = moe_overlap() && graph != nullptr && moe_side != nullptr;
+    auto expand_side = [&]() {
+        ggml_build_forward_expand(graph, moe_side);
+        ggml_build_forward_expand(graph, weights);
+        moe_side = nullptr;
+    };
     ggml_tensor * experts = nullptr;
     llama_hot_experts::layer_view hot;
     if (!cache_ids && lctx.hot_experts && lctx.lora_adapters.empty() && !weight_before_ffn &&
@@ -1803,8 +1819,17 @@ llm_expert_gating_func_type   gating_op,
             return out;
         };
         auto * hk = lctx.hot_experts.get();
+        ggml_tensor * cold_out = nullptr;
+        if (overlap) {
+            // CPU part first, then the side work and the GPU hot experts: they open the device split after it
+            cold_out = path(up_exps, gate_exps, up_gate_exps, down_exps, cold_ids, "cold");
+            ggml_build_forward_expand(graph, cold_out);
+            expand_side();
+        }
         ggml_tensor * hot_out  = path(hk->bank(up_exps), hk->bank(gate_exps), hk->bank(up_gate_exps), hk->bank(down_exps), hot_ids, "hot");
-        ggml_tensor * cold_out = path(up_exps, gate_exps, up_gate_exps, down_exps, cold_ids, "cold");
+        if (!cold_out) {
+            cold_out = path(up_exps, gate_exps, up_gate_exps, down_exps, cold_ids, "cold");
+        }
         experts = ggml_add(ctx, hot_out, cold_out);
         ggml_backend_sched_set_tensor_backend(lctx.sched, experts, hot.backend);
     }
@@ -1919,6 +1944,10 @@ llm_expert_gating_func_type   gating_op,
     cb(par, "ffn_moe_gate_par", il);
 
     experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, selected_experts, cached_down, cache_ids); // [n_embd, n_expert_used, n_tokens]
+    if (overlap) {
+        ggml_build_forward_expand(graph, experts);
+        expand_side();
+    }
     }
     cb(experts, "ffn_moe_down", il);
 
