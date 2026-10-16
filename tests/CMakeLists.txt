@@ -224,3 +224,9 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 add_executable(test-moe-cache-shares test-moe-cache-shares.cpp)
 target_include_directories(test-moe-cache-shares PRIVATE ${PROJECT_SOURCE_DIR}/src)
 add_test(NAME test-moe-cache-shares COMMAND $<TARGET_FILE:test-moe-cache-shares>)
+
+# DeepSeek-V4 speculative checkpoint check; needs a DeepSeek-V4 GGUF (argument or LLAMACPP_TEST_MODELFILE), else skipped
+llama_build(test-dsv4-spec-ckpt.cpp)
+target_include_directories(test-dsv4-spec-ckpt PRIVATE ${PROJECT_SOURCE_DIR}/src)
+add_test(NAME test-dsv4-spec-ckpt COMMAND $<TARGET_FILE:test-dsv4-spec-ckpt>)
+set_tests_properties(test-dsv4-spec-ckpt PROPERTIES LABELS "model" SKIP_RETURN_CODE 77)
