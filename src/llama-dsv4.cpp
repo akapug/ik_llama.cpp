@@ -275,9 +275,7 @@ static llama_context::dsv4_runtime::slot_info dsv4_build_comp_sinfo(
         sinfo.s1 = 0;
     }
 
-    if (n_stream > 1 && sinfo.s1 - sinfo.s0 + 1 != (int32_t) sinfo.n_stream()) {
-        LLAMA_LOG_ERROR("%s: DSV4 compressed streams are not contiguous in batch\n", __func__);
-    }
+    // streams need not be contiguous or ascending: dsv4_comp_get_k gathers them by strm[]
 
     return sinfo;
 }
