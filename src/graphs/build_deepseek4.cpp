@@ -549,7 +549,26 @@ static ggml_tensor * dsv4_comp_get_k(
         return ggml_reshape_4d(ctx, dsv4_cache_view_3d(ctx, cache, n_embd_head, n_kv), n_embd_head, 1, n_kv, 1);
     }
 
-    return dsv4_cache_stream_view_4d(ctx, cache, n_embd_head, n_kv, kv_size, comp.sinfo.s0, (int64_t) comp.sinfo.n_stream());
+    // Graph stream s holds the batch's s-th sequence (first-appearance order), whose cache rows
+    // start at stream strm[s]. One strided view serves the streams when they are s0, s0+1, ...;
+    // otherwise (e.g. slots 0 and 2 decode while slot 1 idles) gather the streams one by one.
+    const int64_t n_stream = (int64_t) comp.sinfo.n_stream();
+    bool in_order = true;
+    for (int64_t s = 0; s < n_stream; ++s) {
+        in_order = in_order && (int64_t) comp.sinfo.strm[(size_t) s] == comp.sinfo.s0 + s;
+    }
+    if (in_order) {
+        return dsv4_cache_stream_view_4d(ctx, cache, n_embd_head, n_kv, kv_size, comp.sinfo.s0, n_stream);
+    }
+
+    ggml_tensor * result = nullptr;
+    for (int64_t s = 0; s < n_stream; ++s) {
+        // a one-stream view is contiguous (its rows are packed), so each concat is a plain copy
+        ggml_tensor * view = dsv4_cache_stream_view_4d(ctx, cache, n_embd_head, n_kv, kv_size,
+                (int64_t) comp.sinfo.strm[(size_t) s], 1);
+        result = result == nullptr ? view : ggml_concat(ctx, result, view, 3);
+    }
+    return result;
 }
 
 static ggml_tensor * dsv4_comp_cpy_k(
@@ -598,7 +617,11 @@ static ggml_tensor * dsv4_build_attn(
     const bool v_trans = v->nb[1] > v->nb[2];
     const int64_t n_stream = k->ne[3];
 
-    if (!cparams.flash_attn && n_stream > 1) {
+    // One attention call per stream (sequence). ggml_flash_attn_ext takes a 2D mask only
+    // (mask->ne[2] == mask->ne[3] == 1), so a multi-sequence batch (-np > 1, one decode
+    // token per slot) cannot hand it the per-stream 4D mask. Everything outside attention
+    // (projections, routed experts) stays batched across the streams.
+    if (n_stream > 1) {
         GGML_ASSERT(q->ne[2] % n_stream == 0);
         const int64_t n_tokens_stream = q->ne[2]/n_stream;
         ggml_tensor * result = nullptr;
@@ -617,6 +640,9 @@ static ggml_tensor * dsv4_build_attn(
             } else {
                 mask_s = ggml_view_2d(ctx, kq_mask, kq_mask->ne[0], kq_mask->ne[1],
                         kq_mask->nb[1], s*kq_mask->nb[3]);
+            }
+            if (cparams.flash_attn) {
+                mask_s = dsv4_pad_mask_tokens(ctx, mask_s, n_tokens_stream);
             }
 
             ggml_tensor * cur_s = dsv4_build_attn(ctx, hparams, cparams,
