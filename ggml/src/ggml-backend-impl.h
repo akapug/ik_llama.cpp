@@ -148,6 +148,34 @@ extern "C" {
 
     GGML_CALL void ggml_backend_register(const char * name, ggml_backend_init_fn init_fn, ggml_backend_buffer_type_t default_buffer_type, void * user_data);
 
+    //
+    // Research host-overhead counters (homelab hostcut lane), default off.
+    // GGML_HOSTCUT_STATS=N prints one line to stderr every N scheduler graph computes with the counts below
+    // accumulated since the previous line. Counting costs one relaxed atomic add per event, only when on.
+    //
+    enum ggml_hostcut_counter {
+        GGML_HC_SPLITS,          // splits computed
+        GGML_HC_DEV_SPLITS,      // splits computed on a non-CPU backend
+        GGML_HC_INPUT_COPIES,    // split input copies (any path)
+        GGML_HC_DEV_SYNC,        // device backend synchronize (cudaStreamSynchronize on the compute stream)
+        GGML_HC_BUF_SET_SYNC,    // buffer set_tensor: H2D memcpy + cudaStreamSynchronize
+        GGML_HC_BUF_GET_SYNC,    // buffer get_tensor: D2H memcpy + cudaStreamSynchronize
+        GGML_HC_SET_ASYNC,       // backend set_tensor_async (H2D, no sync)
+        GGML_HC_GET_ASYNC,       // backend get_tensor_async (D2H, no sync)
+        GGML_HC_EVENT_SYNC,      // event synchronize / wait
+        GGML_HC_EAGER_OPS,       // CUDA ops launched eagerly (each is one or more kernel launches / memcpys)
+        GGML_HC_GRAPH_LAUNCH,    // cudaGraphLaunch
+        GGML_HC_GRAPH_CAPTURE,   // segments captured (eager launch inside a capture)
+        GGML_HC_GRAPH_INSTANTIATE,
+        GGML_HC_GRAPH_UPDATE,    // cudaGraphExecUpdate of an existing executable
+        GGML_HC_GRAPH_CACHE_HIT,
+        GGML_HC_GRAPH_CACHE_MISS,
+        GGML_HC_GRAPH_OFF,       // segment computes that wanted graphs but ran eagerly (disabled/incompatible)
+        GGML_HC_COUNT,
+    };
+    GGML_CALL int  ggml_hostcut_stats_on(void);
+    GGML_CALL void ggml_hostcut_count(enum ggml_hostcut_counter c, int64_t n);
+
 #ifdef  __cplusplus
 }
 #endif
