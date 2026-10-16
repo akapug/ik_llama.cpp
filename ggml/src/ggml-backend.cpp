@@ -14,6 +14,7 @@
 #include <vector>
 #include <set>
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <barrier>
 #include <thread>
@@ -2038,6 +2039,34 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// Research switches for hybrid GPU + CPU-expert decode (research), both default off:
+//  GGML_SCHED_ASYNC_COPY=1  copies between a device backend and the CPU backend are enqueued on the device stream
+//                           (host -> device: no wait at all, the stream orders it; device -> host: all copies of a
+//                           split, then one synchronize) instead of synchronize + blocking copy per input
+//  GGML_SCHED_OVERLAP=1     before a CPU split computes, launch the leading nodes of the following device split that
+//                           read none of that split's input copies (shared expert, GPU hot experts, routing weights),
+//                           so the device runs them while the CPU computes its experts
+static int ggml_backend_sched_env_flag(const char * name) {
+    const char * e = getenv(name);
+    return e ? atoi(e) : 0;
+}
+
+static bool ggml_backend_sched_async_copy() {
+    static const bool on = ggml_backend_sched_env_flag("GGML_SCHED_ASYNC_COPY") != 0;
+    return on;
+}
+
+static bool ggml_backend_sched_overlap() {
+    static const bool on = ggml_backend_sched_env_flag("GGML_SCHED_OVERLAP") != 0;
+    return on;
+}
+
+// the tensor lives in the backend's own default (device) buffer type, so its async get/set may be used
+static bool ggml_backend_sched_on_own_buffer(ggml_backend_t backend, const ggml_tensor * t) {
+    ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+    return buf && !ggml_backend_buffer_is_host(buf) && buf->buft == ggml_backend_get_default_buffer_type(backend);
+}
+
 static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_backend_sched_split * split, std::array<bool, GGML_SCHED_MAX_BACKENDS> & needs_sync,
         std::vector<int32_t> & ids, std::vector<uint32_t> & unique_ids, ggml_tensor * last_ids_tensor) {
     if (split->n_inputs < 1) return;
@@ -2046,6 +2075,9 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t last_input_backend = nullptr;
     bool synced_on_input = false;
+    const bool async_copy = ggml_backend_sched_async_copy() && !sched->callback_copy;
+    std::array<ggml_backend_t, GGML_SCHED_MAX_BACKENDS> pending_get = {};   // backends with device -> host copies in flight
+    int n_pending_get = 0;
     const int n_input_passes = sched->callback_copy ? 2 : 1;
     for (int pass_input = 0; pass_input < n_input_passes*split->n_inputs; ++pass_input) {
         const bool callback_copy_pass = pass_input >= split->n_inputs;
@@ -2074,6 +2106,26 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
             }
             ggml_backend_tensor_copy(input, input_cpy);
         } else {
+            if (async_copy && ggml_backend_is_cpu(input_backend) && !ggml_backend_is_cpu(split_backend) &&
+                    split_backend->iface.set_tensor_async && ggml_backend_buffer_is_host(input->buffer) &&
+                    ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    ggml_backend_sched_on_own_buffer(split_backend, input_cpy)) {
+                // (weights keep the paths below: only the active experts of an offloaded expert tensor are copied)
+                // host -> device on the device stream: ordered after every kernel that still reads input_cpy, and the
+                // CPU backend has already finished writing input (its compute is synchronous)
+                ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                continue;
+            }
+            if (async_copy && ggml_backend_is_cpu(split_backend) && !ggml_backend_is_cpu(input_backend) &&
+                    input_backend->iface.get_tensor_async && input_backend->iface.synchronize &&
+                    ggml_backend_buffer_is_host(input_cpy->buffer) && ggml_backend_sched_on_own_buffer(input_backend, input)) {
+                // device -> host on the device stream, ordered after the producer; one synchronize below covers all
+                ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
+                if (std::find(pending_get.begin(), pending_get.begin() + n_pending_get, input_backend) == pending_get.begin() + n_pending_get) {
+                    pending_get[n_pending_get++] = input_backend;
+                }
+                continue;
+            }
             // wait for the split backend to finish using the input before overwriting it
             if (needs_sync[split_backend_id]) {
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2200,6 +2252,9 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                 }
         }
     }
+    for (int k = 0; k < n_pending_get; ++k) {
+        ggml_backend_synchronize(pending_get[k]);
+    }
 }
 
 static ggml_status ggml_backend_sched_eval(ggml_backend_sched_t sched, ggml_backend_t split_backend, ggml_backend_sched_split * split) {
@@ -2253,6 +2308,33 @@ static ggml_status ggml_backend_sched_eval(ggml_backend_sched_t sched, ggml_back
         }
     }
     return GGML_STATUS_SUCCESS;
+}
+
+// GGML_SCHED_OVERLAP: number of leading nodes of `split` that read none of its input copies (directly or through a
+// view); those nodes depend only on tensors already resident on the split's backend, so they may run before the
+// inputs arrive. Returns 0 when the first node already needs an input.
+static int ggml_backend_sched_independent_prefix(ggml_backend_sched_t sched, ggml_backend_sched_split * split) {
+    std::array<const ggml_tensor *, GGML_SCHED_MAX_SPLIT_INPUTS> cpys;
+    const int n_in = std::min(split->n_inputs, (int) GGML_SCHED_MAX_SPLIT_INPUTS);
+    for (int j = 0; j < n_in; ++j) {
+        cpys[j] = tensor_copy(split->inputs[j], split->backend_id, sched->cur_copy);
+    }
+    auto is_cpy = [&](const ggml_tensor * t) {
+        for (; t; t = t->view_src) {
+            for (int j = 0; j < n_in; ++j) {
+                if (t == cpys[j]) return true;
+            }
+        }
+        return false;
+    };
+    for (int k = 0; k < split->graph.n_nodes; ++k) {
+        const ggml_tensor * node = split->graph.nodes[k];
+        if (is_cpy(node)) return k;
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (node->src[j] && is_cpy(node->src[j])) return k;
+        }
+    }
+    return split->graph.n_nodes;
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
@@ -2537,6 +2619,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     size_t moe_next  = 0; // first moe_infos entry with split >= current split
     size_t moe_enq   = 0; // moe_infos entries already enqueued for lookahead
 
+    // GGML_SCHED_OVERLAP: split `ahead_split` had its first `ahead_n` nodes launched while the previous (CPU) split ran
+    const bool overlap = ggml_backend_sched_overlap() && !sched->callback_eval && !sched->callback_copy;
+    int ahead_split = -1;
+    int ahead_n = 0;
+
     for (int i = 0; i < sched->n_splits; i++) {
 #if IK_PRINT_TIMING
         int64_t tim1 = ggml_time_us();
@@ -2583,7 +2670,42 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
             }
         }
-        auto ec = ggml_backend_sched_eval(sched, split_backend, split);
+        // GGML_SCHED_OVERLAP: this split runs on the CPU (synchronously) and the next one on a device. Launch the next
+        // split's leading nodes that need none of its inputs now, so the device computes them during the CPU split.
+        // Safe for the allocator: those nodes write only device memory, this split's inputs were already copied off
+        // the device above, and they precede every other node of their split in allocation order.
+        if (overlap && i + 1 < sched->n_splits && ggml_backend_is_cpu(split_backend) &&
+                !ggml_backend_is_cpu(sched->backends[splits[i + 1].backend_id])) {
+            ggml_backend_sched_split * next = &splits[i + 1];
+            const int n_head = ggml_backend_sched_independent_prefix(sched, next);
+            if (n_head > 0) {
+                struct ggml_cgraph gv = ggml_graph_view(&next->graph, 0, n_head);
+                auto ec = ggml_backend_graph_compute_async(sched->backends[next->backend_id], &gv);
+                if (ec != GGML_STATUS_SUCCESS) {
+                    return ec;
+                }
+                ahead_split = i + 1;
+                ahead_n = n_head;
+                static int n_logged = 0;
+                if (n_logged < 8) {   // proof the switch fires: a few (split, head/total, first head node) lines
+                    ++n_logged;
+                    fprintf(stderr, "%s: GGML_SCHED_OVERLAP split %d/%d: launched %d of %d nodes ahead (first %s)\n",
+                            __func__, i + 1, sched->n_splits, n_head, next->graph.n_nodes, next->graph.nodes[0]->name);
+                }
+            }
+        }
+
+        enum ggml_status ec = GGML_STATUS_SUCCESS;
+        if (i == ahead_split) {
+            // the head already ran ahead; compute the rest
+            if (ahead_n < split->graph.n_nodes) {
+                struct ggml_cgraph gv = ggml_graph_view(&split->graph, ahead_n, split->graph.n_nodes);
+                ec = ggml_backend_graph_compute_async(split_backend, &gv);
+            }
+            ahead_split = -1;
+        } else {
+            ec = ggml_backend_sched_eval(sched, split_backend, split);
+        }
         if (ec != GGML_STATUS_SUCCESS) {
             return ec;
         }
