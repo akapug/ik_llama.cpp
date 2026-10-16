@@ -987,6 +987,15 @@ struct common_speculative_state_suffix : public common_speculative_state {
     float  base_p_min    = 0.1f;
     float  eff_p_min     = 0.1f;
 
+    // Acceptance gate (research, default off): when the EMA of the per-draft accepted fraction falls below
+    // LLAMA_SUFFIX_GATE_ACC, skip LLAMA_SUFFIX_GATE_COOL draft calls (the next stage drafts instead), then probe again.
+    // A rejected draft token costs a full verify row; on CPU-offloaded MoE that is ~a decode step.
+    float  gate_acc      = getenv("LLAMA_SUFFIX_GATE_ACC")  ? (float) atof(getenv("LLAMA_SUFFIX_GATE_ACC")) : 0.0f;
+    int    gate_cool     = getenv("LLAMA_SUFFIX_GATE_COOL") ? atoi(getenv("LLAMA_SUFFIX_GATE_COOL")) : 8;
+    float  acc_ema       = 1.0f;
+    int    cooldown      = 0;
+    size_t n_gated       = 0;
+
     common_speculative_state_suffix(
             enum common_speculative_type type,
             int max_depth,
@@ -1012,6 +1021,8 @@ struct common_speculative_state_suffix : public common_speculative_state {
         n_draft_last = 0;
         had_accept   = false;
         n_low        = 0;
+        acc_ema      = 1.0f;
+        cooldown     = 0;
         GGML_UNUSED(prompt);
     }
 
@@ -1055,6 +1066,14 @@ struct common_speculative_state_suffix : public common_speculative_state {
         context.push_back(id_last);
         const int min_match_len = std::max(1, params.suffix_min_match_len);
 
+        if (gate_acc > 0.0f && cooldown > 0) {
+            cooldown--;
+            n_gated++;
+            result.clear();
+            n_draft_last = 0;
+            return;
+        }
+
         result = tree.speculate(
             context.data(), (int)context.size(),
             params.n_max,
@@ -1083,6 +1102,13 @@ struct common_speculative_state_suffix : public common_speculative_state {
         }
         had_accept = true;
         const double f_acc = (double)n_accepted / (double)n_draft_last;
+        if (gate_acc > 0.0f) {
+            acc_ema = 0.7f * acc_ema + 0.3f * (float) f_acc;
+            if (acc_ema < gate_acc) {
+                cooldown = gate_cool;
+                acc_ema  = gate_acc;   // probe again at the threshold after the cooldown
+            }
+        }
         if (f_acc < 0.5) {
             if (++n_low >= 3) {
                 eff_p_min = std::min(eff_p_min + 0.1f, std::min(0.99f, std::max(0.5f, base_p_min + 0.2f)));
