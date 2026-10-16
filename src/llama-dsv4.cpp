@@ -13,6 +13,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <stdexcept>
@@ -1253,14 +1254,44 @@ void llama_kv_cache::gpu_checkpoint::release_dsv4_snapshot() {
     dsv4_shadow_saved = false;
 }
 
+int llama_dsv4_per_step_max_rows() {
+    static const int max_rows = [] {
+        const char * env = getenv("LLAMA_DSV4_PER_STEP_MAX_ROWS");
+        if (env == nullptr || *env == '\0') {
+            return DSV4_PER_STEP_DEFAULT_MAX_ROWS;
+        }
+        char * end = nullptr;
+        const long v = strtol(env, &end, 10);
+        if (end == env || *end != '\0' || v <= 0 || v > (1 << 20)) {
+            LLAMA_LOG_WARN("%s: ignoring LLAMA_DSV4_PER_STEP_MAX_ROWS=%s; using %d\n",
+                    __func__, env, DSV4_PER_STEP_DEFAULT_MAX_ROWS);
+            return DSV4_PER_STEP_DEFAULT_MAX_ROWS;
+        }
+        return (int) v;
+    }();
+    return max_rows;
+}
+
+int llama_dsv4_per_step_capacity(const llama_context & ctx) {
+    return ctx.kv_self.ckpt.dsv4_per_step_allocated ? ctx.kv_self.ckpt.dsv4_per_step_max_tokens : 0;
+}
+
 static bool dsv4_per_step_alloc(llama_context & ctx, int max_tokens) {
     auto & ckpt = ctx.kv_self.ckpt;
     const auto states = dsv4_state_tensors(ctx);
-    if (states.empty() || max_tokens <= 0 || max_tokens > DSV4_PER_STEP_MAX_STATE_ROWS) {
-        if (max_tokens > DSV4_PER_STEP_MAX_STATE_ROWS) {
-            LLAMA_LOG_WARN("%s: DSV4 per-step supports at most %d verification rows; requested %d\n",
-                    __func__, DSV4_PER_STEP_MAX_STATE_ROWS, max_tokens);
-        }
+    const int max_rows = llama_dsv4_per_step_max_rows();
+    if (max_tokens > max_rows) {
+        LLAMA_LOG_WARN("%s: DSV4 per-step supports at most %d verification rows (LLAMA_DSV4_PER_STEP_MAX_ROWS); requested %d\n",
+                __func__, max_rows, max_tokens);
+        return false;
+    }
+    // capture and restore index the rows of one ubatch: a batch split over ubatches would keep only the last one's rows
+    if (max_tokens > (int) ctx.cparams.n_ubatch) {
+        LLAMA_LOG_WARN("%s: DSV4 per-step needs the %d-token verification batch in one ubatch, but n_ubatch=%u; raise -ub\n",
+                __func__, max_tokens, ctx.cparams.n_ubatch);
+        return false;
+    }
+    if (states.empty() || max_tokens <= 0) {
         return false;
     }
     if (ckpt.dsv4_per_step_allocated && ckpt.dsv4_per_step_max_tokens >= max_tokens &&
@@ -1447,6 +1478,10 @@ static bool dsv4_per_step_capture_group(
 
 bool llama_dsv4_per_step_capture_active(const llama_context & ctx) {
     return ctx.kv_self.ckpt.selected_spec_mode == LLAMA_SPEC_CKPT_PER_STEP && ctx.cparams.mtp_op_type == MTP_OP_NONE;
+}
+
+bool llama_dsv4_per_step_capture_batch(const llama_context & ctx, size_t n_rows) {
+    return llama_dsv4_per_step_capture_active(ctx) && n_rows <= (size_t) llama_dsv4_per_step_capacity(ctx);
 }
 
 bool llama_dsv4_spec_ckpt_capture_rows(llama_context * ctx) {
