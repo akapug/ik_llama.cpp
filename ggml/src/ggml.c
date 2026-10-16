@@ -3024,6 +3024,8 @@ struct ggml_context_container {
     struct ggml_context context;
 };
 
+#define GGML_MOE_MAX_GROUPS 8
+
 struct ggml_compute_state_shared {
     const struct ggml_cgraph * cgraph;
     const struct ggml_cplan * cplan;
@@ -3041,6 +3043,10 @@ struct ggml_compute_state_shared {
     atomic_int current_chunk; // currently processing chunk during mul_mat, shared between all the threads
 
     enum ggml_status ec;
+
+    int serial_next; // GGML_SERIAL_SMALL: first node after the run thread 0 just computed alone
+
+    atomic_int group_chunk[GGML_MOE_MAX_GROUPS]; // GGML_MOE_GROUPS: next chunk per thread group
 };
 
 struct ggml_compute_state {
@@ -4919,12 +4925,76 @@ static inline void ggml_barrier_impl(struct ggml_compute_state_shared * shared) 
     }
 }
 
+// CPU threading research knobs (all default off; read once from the environment):
+//  GGML_BARRIER_SPIN=1     OpenMP builds: use ggml's own atomic spin barrier for every batch size, not `omp barrier`
+//                          (libgomp's barrier makes the last arriving thread do a futex_wake syscall every time).
+//  GGML_OMP_FAST_ENTRY=1   skip two barriers per graph compute: the `omp single` that re-reads the team size (when the
+//                          team has the requested size) and the per-node barrier after the last node (the parallel
+//                          region / thread join ends with one anyway).
+//  GGML_SERIAL_SMALL=B     a run of consecutive nodes that each touch <= B bytes (dst + srcs) is computed by thread 0
+//                          alone, followed by ONE barrier, instead of every thread entering each tiny op plus one
+//                          barrier per node (norms, adds, scales, top-k, small copies of a decode step).
+//  GGML_CPU_STATS=N        every N graph computes print per-compute averages: nodes, barriers, serial runs, time
+//                          from the call to the first node (fork), in barriers (thread 0), and total.
+//  GGML_MOE_GROUPS=G[,C]   routed-expert matmuls (MUL_MAT_ID, MOE_FUSED_UP_GATE; builds without GGML_EXPERT_CHUNKING):
+//                          threads form G contiguous groups (G=2 with -cr 0-19 = one group per socket); group g owns
+//                          the same contiguous row range the static split gives its threads (so first-touch pages
+//                          stay local) and splits it into C chunks (default 2 x threads per group) that its threads
+//                          take from a shared counter, so a slow or late thread no longer holds up the whole step.
+struct ggml_cpu_knobs {
+    int    barrier_spin;
+    int    fast_entry;
+    size_t serial_small;
+    int    stats;
+    int    moe_groups;
+    int    moe_chunks;
+};
+static struct ggml_cpu_knobs g_cpu_knobs;
+static atomic_int g_cpu_knobs_init = 0;
+
+static const struct ggml_cpu_knobs * ggml_get_cpu_knobs(void) {
+    if (atomic_load_explicit(&g_cpu_knobs_init, memory_order_acquire) == 0) {
+        struct ggml_cpu_knobs k;
+        const char * e;
+        k.barrier_spin = (e = getenv("GGML_BARRIER_SPIN"))   ? atoi(e) != 0 : 0;
+        k.fast_entry   = (e = getenv("GGML_OMP_FAST_ENTRY")) ? atoi(e) != 0 : 0;
+        k.serial_small = (e = getenv("GGML_SERIAL_SMALL"))   ? (size_t) strtoull(e, NULL, 10) : 0;
+        k.stats        = (e = getenv("GGML_CPU_STATS"))      ? atoi(e) : 0;
+        k.moe_groups = 0;
+        k.moe_chunks = 0;
+        if ((e = getenv("GGML_MOE_GROUPS")) != NULL) {
+            int g = 0, c = 0;
+            if (sscanf(e, "%d,%d", &g, &c) >= 1 && g >= 1) {
+                k.moe_groups = MIN(g, GGML_MOE_MAX_GROUPS);
+                k.moe_chunks = MAX(c, 0);
+            }
+        }
+        if (k.barrier_spin || k.fast_entry || k.serial_small || k.stats || k.moe_groups) {
+            fprintf(stderr, "ggml cpu knobs: GGML_BARRIER_SPIN=%d GGML_OMP_FAST_ENTRY=%d GGML_SERIAL_SMALL=%zu GGML_CPU_STATS=%d "
+                    "GGML_MOE_GROUPS=%d,%d\n", k.barrier_spin, k.fast_entry, k.serial_small, k.stats, k.moe_groups, k.moe_chunks);
+        }
+        g_cpu_knobs = k; // identical values if two threads race here
+        atomic_store_explicit(&g_cpu_knobs_init, 1, memory_order_release);
+    }
+    return &g_cpu_knobs;
+}
+
+static inline int64_t ggml_cpu_stats_ns(void) {
+#if defined(_WIN32)
+    return ggml_time_us()*1000;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec*1000000000 + (int64_t)ts.tv_nsec;
+#endif
+}
+
 #ifdef GGML_USE_OPENMP
 static void ggml_barrier(struct ggml_compute_state_shared * shared) {
     if (shared->n_threads == 1) {
         return;
     }
-    if (shared && shared->n_batch > 32) {
+    if (shared && (shared->n_batch > 32 || g_cpu_knobs.barrier_spin)) {
         ggml_barrier_impl(shared);
         return;
     }
@@ -18607,6 +18677,46 @@ static int ggml_compute_forward_mul_mat(
     return node_n;
 }
 
+// GGML_MOE_GROUPS: thread group g of G takes chunks of the experts with rows, C chunks per expert, from its own counter.
+// Chunk c of group g is chunk g*C + c of G*C equal row slices, so group g covers the rows its threads own in the
+// static split (up to one slice of rounding), which keeps first-touch NUMA placement local.
+struct ggml_moe_group_iter {
+    int g, G, C;
+    int last_a, last_acc; // fetch_add values only grow per thread, so the expert walk resumes where it stopped
+};
+
+static bool ggml_moe_group_init(const struct ggml_compute_params * params, struct ggml_moe_group_iter * it) {
+    if (g_cpu_knobs.moe_groups < 1 || params->nth < 2) {
+        return false;
+    }
+    const int G = MIN(g_cpu_knobs.moe_groups, params->nth);
+    it->G = G;
+    it->g = params->ith * G / params->nth;
+    it->C = g_cpu_knobs.moe_chunks > 0 ? g_cpu_knobs.moe_chunks : 2*((params->nth + G - 1) / G);
+    it->last_a = 0;
+    it->last_acc = 0;
+    return true;
+}
+
+static bool ggml_moe_group_next(struct ggml_compute_state_shared * shared, struct ggml_moe_group_iter * it,
+        const int64_t * counts, int n_as, int * cur_a, int * chunk, int * n_chunks) {
+    const int k = atomic_fetch_add(&shared->group_chunk[it->g], 1);
+    int acc = it->last_acc;
+    for (int a = it->last_a; a < n_as; a++) {
+        if (counts[a] == 0) continue;
+        if (k < acc + it->C) {
+            it->last_a = a;
+            it->last_acc = acc;
+            *cur_a = a;
+            *chunk = it->g*it->C + (k - acc);
+            *n_chunks = it->G*it->C;
+            return true;
+        }
+        acc += it->C;
+    }
+    return false;
+}
+
 // ggml_compute_forward_mul_mat_id
 
 static void ggml_compute_forward_mul_mat_id(
@@ -18701,6 +18811,9 @@ static void ggml_compute_forward_mul_mat_id(
     if (ith == 0) {
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
+        for (int g = 0; g < GGML_MOE_MAX_GROUPS; ++g) {
+            atomic_store(&params->shared->group_chunk[g], 0); // GGML_MOE_GROUPS; read only after the barrier below
+        }
 
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
@@ -18768,6 +18881,25 @@ IQK_MulMat_Not_Available0:;
         atomic_store(&params->shared->current_chunk, 0);
     }
     ggml_barrier(params->shared);
+#else
+    {
+        struct ggml_moe_group_iter git;
+        if (ne13 == 1 && dst->type == GGML_TYPE_F32 && ggml_moe_group_init(params, &git)) {
+            const void * wdata_mm    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+            const size_t row_size_mm = ggml_row_size(vec_dot_type, ne10);
+            int cur_a, chunk, n_chunks;
+            while (ggml_moe_group_next(params->shared, &git, matrix_row_counts, n_as, &cur_a, &chunk, &n_chunks)) {
+                if (!iqk_mul_mat_moe(ne01, matrix_row_counts[cur_a], ne00, ne11,
+                            src0->type, (const char *) src0->data + cur_a*nb02, nb01,
+                            vec_dot_type, (const char *)wdata_mm, row_size_mm,
+                            (float *)dst->data, nb1, nb2,
+                            matrix_rows + cur_a*ne12, chunk, n_chunks)) {
+                    GGML_ABORT("GGML_MOE_GROUPS: iqk has no MoE kernel for %s; unset GGML_MOE_GROUPS", ggml_type_name(src0->type));
+                }
+            }
+            return;
+        }
+    }
 #endif
 #endif
 
@@ -19030,6 +19162,9 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
     if (ith == 0) {
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
+        for (int g = 0; g < GGML_MOE_MAX_GROUPS; ++g) {
+            atomic_store(&params->shared->group_chunk[g], 0); // GGML_MOE_GROUPS; read only after the barrier below
+        }
 
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
@@ -19120,8 +19255,18 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
 
     // so GGML_TENSOR_BINARY_OP_LOCALS works
 
-    // compute each matrix multiplication in sequence
+    struct ggml_moe_group_iter git;
+    const bool grouped = ggml_moe_group_init(params, &git);
+    int g_cur_a = 0, g_chunk = ith, g_n_chunks = nth;
+
+    // compute each matrix multiplication in sequence (or, with GGML_MOE_GROUPS, the chunks this thread's group hands out)
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+        if (grouped) {
+            if (!ggml_moe_group_next(params->shared, &git, matrix_row_counts, n_as, &g_cur_a, &g_chunk, &g_n_chunks)) {
+                break;
+            }
+            cur_a = g_cur_a;
+        }
         const int64_t cne1 = matrix_row_counts[cur_a];
 
         if (cne1 == 0) {
@@ -19155,8 +19300,11 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                             vec_dot_type, (const char *)wdata, row_size,
                             up_b_cur, gate_b_cur,
                             (float *)dst->data, nb1, nb2,
-                            matrix_rows + cur_a*ne12, limit, ith, nth)) GGML_ABORT("fatal error");
+                            matrix_rows + cur_a*ne12, limit, g_chunk, g_n_chunks)) GGML_ABORT("fatal error");
 
+        if (grouped) {
+            cur_a = -1; // the next chunk may belong to any expert (the loop increment makes this 0)
+        }
     }
 #endif
 #undef MMID_MATRIX_ROW
@@ -29607,11 +29755,69 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
     return cplan;
 }
 
+// GGML_SERIAL_SMALL: a node is "small" when its dst plus all srcs touch <= limit bytes (a cost proxy: a decode-step
+// norm/add/scale/top-k is a few KiB, a matmul or attention over real weights/KV is far above any sane limit).
+static bool ggml_node_is_small(const struct ggml_tensor * node, size_t limit) {
+    switch (node->op) {
+        case GGML_OP_REDUCE:
+        case GGML_OP_FAKE_CPY:
+            return false;
+        default:
+            break;
+    }
+    size_t bytes = ggml_nbytes(node);
+    for (int i = 0; i < GGML_MAX_SRC && bytes <= limit; ++i) {
+        if (node->src[i]) bytes += ggml_nbytes(node->src[i]);
+    }
+    return bytes <= limit;
+}
+
+// GGML_CPU_STATS accumulators; only thread 0 of a compute (the calling thread) writes them
+static struct {
+    int64_t calls, nodes, barriers, runs, run_nodes, barrier_ns, fork_ns, join_ns, total_ns, threads;
+} g_cpu_stats;
+#if defined(_MSC_VER)
+static __declspec(thread) int64_t g_cpu_stats_fork_ns;
+#else
+static __thread int64_t g_cpu_stats_fork_ns;
+#endif
+static int64_t g_cpu_stats_loop_end_ns; // thread 0 left its node loop (written and read by the calling thread)
+
+static void ggml_cpu_stats_add(int nodes, int barriers, int runs, int run_nodes, int64_t barrier_ns) {
+    g_cpu_stats.nodes += nodes;
+    g_cpu_stats.barriers += barriers;
+    g_cpu_stats.runs += runs;
+    g_cpu_stats.run_nodes += run_nodes;
+    g_cpu_stats.barrier_ns += barrier_ns;
+    g_cpu_stats.fork_ns += g_cpu_stats_fork_ns;
+    g_cpu_stats_loop_end_ns = ggml_cpu_stats_ns();
+}
+
+static void ggml_cpu_stats_call(int64_t total_ns, int n_threads) {
+    g_cpu_stats.join_ns += ggml_cpu_stats_ns() - g_cpu_stats_loop_end_ns;
+    g_cpu_stats.calls++;
+    g_cpu_stats.total_ns += total_ns;
+    g_cpu_stats.threads += n_threads;
+    if (g_cpu_stats.calls >= g_cpu_knobs.stats) {
+        const double c = (double) g_cpu_stats.calls;
+        fprintf(stderr, "ggml cpu stats: %lld computes, per compute: threads %.1f nodes %.1f serial runs %.1f (%.1f nodes) "
+                "barriers %.1f | fork %.2f us, barrier wait (thread 0) %.2f us, join %.2f us, total %.2f us\n",
+                (long long) g_cpu_stats.calls, g_cpu_stats.threads/c, g_cpu_stats.nodes/c, g_cpu_stats.runs/c,
+                g_cpu_stats.run_nodes/c, g_cpu_stats.barriers/c, g_cpu_stats.fork_ns/c/1e3,
+                g_cpu_stats.barrier_ns/c/1e3, g_cpu_stats.join_ns/c/1e3, g_cpu_stats.total_ns/c/1e3);
+        memset(&g_cpu_stats, 0, sizeof(g_cpu_stats));
+    }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
 
     const struct ggml_cgraph * cgraph = state->shared->cgraph;
     const struct ggml_cplan  * cplan  = state->shared->cplan;
+
+    if (g_cpu_knobs.stats > 0 && state->ith == 0) {
+        g_cpu_stats_fork_ns = ggml_cpu_stats_ns() - g_cpu_stats_fork_ns; // set to the call time by ggml_graph_compute
+    }
 
     set_numa_thread_affinity(state->ith);
     set_cpu_thread_affinity(cplan, state->ith); // explicit affinity takes precedence over NUMA
@@ -29629,10 +29835,61 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     int64_t t_eval  = 0;
 #endif
 
+    const struct ggml_cpu_knobs * knobs = &g_cpu_knobs;
+    const size_t serial_small = params.nth > 1 ? knobs->serial_small : 0;
+    const bool   stats = knobs->stats > 0 && state->ith == 0;
+    int64_t st_barrier_ns = 0;
+    int st_nodes = 0, st_barriers = 0, st_runs = 0, st_run_nodes = 0;
+
     for (int node_n = 0; node_n < cgraph->n_nodes; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
         if (ggml_is_noop(node)) continue;
+
+        if (serial_small && ggml_node_is_small(node, serial_small)) {
+            // thread 0 computes the whole run of small nodes alone; one barrier for the run
+            if (state->ith == 0) {
+                struct ggml_compute_state_shared one = {
+                    /*.cgraph              =*/ state->shared->cgraph,
+                    /*.cgraph_plan         =*/ state->shared->cplan,
+                    /*.n_threads           =*/ 1,
+                    /*.n_batch             =*/ state->shared->n_batch,
+                    /*.n_barrier           =*/ 0,
+                    /*.n_barrier_passed    =*/ 0,
+                    /*.abort_callback      =*/ NULL,
+                    /*.abort_callback_data =*/ NULL,
+                    /*.current_chunk       =*/ 0,
+                    /*.ec                  =*/ GGML_STATUS_SUCCESS,
+                    /*.serial_next         =*/ 0,
+                    /*.group_chunk         =*/ { 0 },
+                };
+                struct ggml_compute_params p1 = params;
+                p1.nth = 1;
+                p1.shared = &one;
+                int n = node_n;
+                for (; n < cgraph->n_nodes; n++) {
+                    struct ggml_tensor * t = cgraph->nodes[n];
+                    if (ggml_is_noop(t)) continue;
+                    if (!ggml_node_is_small(t, serial_small)) break;
+                    n = ggml_compute_forward(&p1, t, cgraph, n);
+                    if (stats) st_run_nodes++;
+                }
+                state->shared->serial_next = n;
+                if (cplan->abort_callback && cplan->abort_callback(cplan->abort_callback_data)) {
+                    state->shared->ec = GGML_STATUS_ABORTED;
+                }
+                if (stats) st_runs++;
+            }
+            const int64_t tb = stats ? ggml_cpu_stats_ns() : 0;
+            ggml_barrier(state->shared);
+            if (stats) { st_barrier_ns += ggml_cpu_stats_ns() - tb; st_barriers++; }
+            // the next run can only start after the barrier of a parallel node, so serial_next is stable here
+            node_n = state->shared->serial_next - 1;
+            if (state->shared->ec != GGML_STATUS_SUCCESS) {
+                break;
+            }
+            continue;
+        }
 
 #if IK_PRINT_TIMING
         int64_t tim1 = ggml_time_us();
@@ -29642,16 +29899,26 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         int64_t tim2 = ggml_time_us();
         t_eval += tim2 - tim1;
 #endif
+        if (stats) st_nodes++;
 
         if (state->ith == 0 && cplan->abort_callback && cplan->abort_callback(cplan->abort_callback_data)) {
             state->shared->ec = GGML_STATUS_ABORTED;
         }
 
+        if (knobs->fast_entry && node_n >= cgraph->n_nodes - 1) {
+            break; // last node: the end of the parallel region (or the thread join) is the barrier
+        }
+
+        const int64_t tb = stats ? ggml_cpu_stats_ns() : 0;
         ggml_barrier(state->shared);
+        if (stats) { st_barrier_ns += ggml_cpu_stats_ns() - tb; st_barriers++; }
 
         if (state->shared->ec != GGML_STATUS_SUCCESS) {
             break;
         }
+    }
+    if (stats) {
+        ggml_cpu_stats_add(st_nodes, st_barriers, st_runs, st_run_nodes, st_barrier_ns);
     }
 #if IK_PRINT_TIMING
     int64_t t_end = ggml_time_us();
@@ -29667,6 +29934,10 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
     int n_threads = cplan->n_threads;
+
+    const struct ggml_cpu_knobs * knobs = ggml_get_cpu_knobs();
+    const int64_t t_call = knobs->stats > 0 ? ggml_cpu_stats_ns() : 0;
+    g_cpu_stats_fork_ns = t_call;
 
 #if defined(__gnu_linux__)
     // the calling thread is worker 0 and gets pinned below; remember its affinity
@@ -29687,6 +29958,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         /*.abort_callback_data     =*/ NULL,
         /*.current_chunk           =*/ 0,
         /*.ec                      =*/ GGML_STATUS_SUCCESS,
+        /*.serial_next             =*/ 0,
+        /*.group_chunk             =*/ { 0 },
     };
 
 #ifdef GGML_USE_OPENMP
@@ -29696,11 +29969,14 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 //#endif
         #pragma omp parallel num_threads(n_threads)
         {
-            #pragma omp single
-            {
-                // update the number of threads from the actual number of threads that we got from OpenMP
-                n_threads = omp_get_num_threads();
-                state_shared.n_threads = n_threads;
+            // GGML_OMP_FAST_ENTRY: the team size is the same for every member, so all take the same branch
+            if (!(knobs->fast_entry && omp_get_num_threads() == n_threads)) {
+                #pragma omp single
+                {
+                    // update the number of threads from the actual number of threads that we got from OpenMP
+                    n_threads = omp_get_num_threads();
+                    state_shared.n_threads = n_threads;
+                }
             }
 
             struct ggml_compute_state worker = {
@@ -29755,6 +30031,10 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
+
+    if (knobs->stats > 0) {
+        ggml_cpu_stats_call(ggml_cpu_stats_ns() - t_call, n_threads);
+    }
 
 #if defined(__gnu_linux__)
     if (restore_affinity) {
