@@ -900,6 +900,7 @@ struct ggml_tensor_extra_gpu {
 #endif
 
 struct ggml_cuda_graph;
+struct ggml_cuda_graph_slot;
 
 struct ggml_backend_cuda_context {
     int device;
@@ -923,6 +924,9 @@ struct ggml_backend_cuda_context {
     ggml_cuda_graph * cur_graph = nullptr;
 
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+
+    // GGML_CUDA_GRAPH_CACHE (research, hostcut): several executables per segment key
+    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph_slot>> cuda_graph_slots;
 
 #endif
 

@@ -42,6 +42,24 @@ struct ggml_cuda_graph {
     // Index to allow each cpy kernel to be aware of it's position within the graph
     // relative to other cpy nodes.
     int graph_cpynode_index = -1;
+    // GGML_CUDA_GRAPH_CACHE: last use tick (LRU) and "this exact segment cannot be captured" (props kept, no instance)
+    uint64_t last_use = 0;
+    bool incompatible = false;
+#endif
+};
+
+// GGML_CUDA_GRAPH_CACHE (research, hostcut lane): up to N captured executables per segment key (first node),
+// each tied to the exact node properties it was captured with. Hybrid decode alternates shapes (speculative verify
+// batches of 1..n_max+1 tokens, DSV4 compressor phases), which with one executable per key means a re-capture on
+// every change and, after 4 in a row, graphs off for that segment for good.
+struct ggml_cuda_graph_slot {
+#ifdef USE_CUDA_GRAPH
+    std::vector<std::unique_ptr<ggml_cuda_graph>> entries;
+    uint64_t tick = 0;
+    int hits = 0;     // decayed counts (halved every 64 calls)
+    int misses = 0;
+    int calls = 0;
+    bool disabled = false;
 #endif
 };
 

@@ -26,6 +26,53 @@
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
+// research host-overhead counters (hostcut lane), GGML_HOSTCUT_STATS=N, default off (see ggml-backend-impl.h)
+#include <atomic>
+static int ggml_hostcut_every() {
+    static const int n = [] {
+        const char * e = getenv("GGML_HOSTCUT_STATS");
+        return e ? std::max(0, atoi(e)) : 0;
+    }();
+    return n;
+}
+
+static std::atomic<int64_t> g_hostcut[GGML_HC_COUNT];
+
+GGML_CALL int ggml_hostcut_stats_on(void) {
+    return ggml_hostcut_every() > 0;
+}
+
+GGML_CALL void ggml_hostcut_count(enum ggml_hostcut_counter c, int64_t n) {
+    if (ggml_hostcut_every() > 0) {
+        g_hostcut[c].fetch_add(n, std::memory_order_relaxed);
+    }
+}
+
+// one stderr line per N computes: counts since the previous line, divided by the number of computes in the window
+static void ggml_hostcut_report(int n_splits, int64_t t_us) {
+    static const char * names[GGML_HC_COUNT] = {
+        "splits", "dev_splits", "input_copies", "dev_sync", "buf_set_sync", "buf_get_sync", "set_async", "get_async",
+        "event_sync", "eager_ops", "graph_launch", "graph_capture", "graph_inst", "graph_update", "cache_hit",
+        "cache_miss", "graph_off",
+    };
+    static int64_t n_calls = 0, n_lines = 0, t_sum = 0;
+    ++n_calls;
+    t_sum += t_us;
+    if (n_calls < ggml_hostcut_every()) {
+        return;
+    }
+    char buf[1024];
+    int off = snprintf(buf, sizeof(buf), "hostcut_stats: line=%lld computes=%lld last_n_splits=%d us_per_compute=%.0f",
+            (long long) n_lines++, (long long) n_calls, n_splits, (double) t_sum / n_calls);
+    for (int i = 0; i < GGML_HC_COUNT && off < (int) sizeof(buf) - 48; ++i) {
+        const int64_t v = g_hostcut[i].exchange(0, std::memory_order_relaxed);
+        off += snprintf(buf + off, sizeof(buf) - off, " %s=%.1f", names[i], (double) v / n_calls);
+    }
+    fprintf(stderr, "%s\n", buf);
+    n_calls = 0;
+    t_sum = 0;
+}
+
 // backend buffer type
 
 const char * ggml_backend_buft_name(ggml_backend_buffer_type_t buft) {
@@ -428,12 +475,14 @@ void ggml_backend_event_record(ggml_backend_event_t event) {
 
 void ggml_backend_event_synchronize(ggml_backend_event_t event) {
     GGML_ASSERT(event->backend->iface.event_synchronize != NULL);
+    ggml_hostcut_count(GGML_HC_EVENT_SYNC, 1);
 
     event->backend->iface.event_synchronize(event);
 }
 
 void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
     GGML_ASSERT(backend->iface.event_wait != NULL);
+    ggml_hostcut_count(GGML_HC_EVENT_SYNC, 1);
 
     backend->iface.event_wait(backend, event);
 }
@@ -1223,6 +1272,9 @@ struct ggml_backend_sched {
     std::vector<std::vector<ggml_backend_sched_split*>> backend_splits;
     std::array<bool, GGML_SCHED_MAX_BACKENDS> needs_sync;
     std::array<bool, GGML_SCHED_MAX_BACKENDS> own_cpy;
+    // GGML_SCHED_ASYNC_COPY: a host -> device copy on this device's stream may still be reading host memory (pinned
+    // sources are read by DMA when the stream reaches the copy, not when cudaMemcpyAsync returns)
+    std::array<bool, GGML_SCHED_MAX_BACKENDS> h2d_pending;
 
     bool only_active_experts;
     bool split_mode_graph;
@@ -2114,6 +2166,7 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                 // host -> device on the device stream: ordered after every kernel that still reads input_cpy, and the
                 // CPU backend has already finished writing input (its compute is synchronous)
                 ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                sched->h2d_pending[split_backend_id] = true;
                 continue;
             }
             if (async_copy && ggml_backend_is_cpu(split_backend) && !ggml_backend_is_cpu(input_backend) &&
@@ -2254,6 +2307,21 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
     }
     for (int k = 0; k < n_pending_get; ++k) {
         ggml_backend_synchronize(pending_get[k]);
+        for (int b = 0; b < sched->n_backends; ++b) {
+            if (sched->backends[b] == pending_get[k]) sched->h2d_pending[b] = false;
+        }
+    }
+}
+
+// GGML_SCHED_ASYNC_COPY: before the CPU writes host memory (a CPU split computes), finish any device stream that may
+// still DMA-read a pinned host source of an earlier async copy. In the hybrid GPU + CPU-expert layout every CPU split
+// first waits on the device for its own inputs (which clears the flag above), so this normally costs nothing.
+static void ggml_backend_sched_finish_h2d(ggml_backend_sched_t sched) {
+    for (int b = 0; b < sched->n_backends; ++b) {
+        if (sched->h2d_pending[b]) {
+            ggml_backend_synchronize(sched->backends[b]);
+            sched->h2d_pending[b] = false;
+        }
     }
 }
 
@@ -2651,6 +2719,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor);
+        if (ggml_hostcut_stats_on()) {
+            ggml_hostcut_count(GGML_HC_SPLITS, 1);
+            ggml_hostcut_count(GGML_HC_DEV_SPLITS, ggml_backend_is_cpu(split_backend) ? 0 : 1);
+            ggml_hostcut_count(GGML_HC_INPUT_COPIES, split->n_inputs);
+        }
+        if (ggml_backend_is_cpu(split_backend)) {
+            ggml_backend_sched_finish_h2d(sched);
+        }
 
         // ids are now final and host-visible; enqueue the selected expert
         // slices of this split's host-computed MoE matmuls (up/gate and down
@@ -2965,6 +3041,12 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
+    if (ggml_hostcut_stats_on()) {
+        const int64_t t0 = ggml_time_us();
+        const enum ggml_status st = ggml_backend_sched_compute_splits(sched);
+        ggml_hostcut_report(sched->n_splits, ggml_time_us() - t0);
+        return st;
+    }
     return ggml_backend_sched_compute_splits(sched);
 }
 
