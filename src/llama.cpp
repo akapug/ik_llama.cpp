@@ -656,6 +656,11 @@ static inline uint64_t model_state_hash(const llama_context & lctx) {
     mix(lctx.dsv4.raw.write_src_idxs.size());
     mix(lctx.dsv4.raw.write_dst_idxs.size());
     mix(lctx.dsv4.raw.read_dst_idxs.size());
+    if (lctx.cparams.n_seq_max > 1) {
+        // with several slots the raw keys are gathered per sequence and the graph bakes the
+        // visible row count (raw.n_kv) into its mask views; it grows every token
+        mix(lctx.dsv4.raw.n_kv);
+    }
     // graphs of per-step checkpointed batches keep the per-token compressor state rows (llama_dsv4_spec_ckpt_capture_rows)
     mix(llama_dsv4_per_step_capture_active(lctx) ? 1 : 0);
     //mix(lctx.dsv4.lid_plan.n_kv > lctx.model.hparams.indexer_top_k);
