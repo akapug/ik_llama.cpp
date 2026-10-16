@@ -3702,7 +3702,7 @@ void server_context::add_sampled_tokens() {
 
             static const llama_tokens empty_prompt;
             // DFlash/DSpark drafts ignore the text stream, so skip it when mtmd is loaded
-            const llama_tokens & cached_text_tokens = slot.params.speculative.has_dflash_family_stage()
+            const llama_tokens & cached_text_tokens = slot.params.speculative.has_dflash_family_stage() && !slot.params.speculative.has_composite_stage_chain()
                 ? empty_prompt
                 : slot.uses_mtp() && !slot.params.speculative.has_composite_stage_chain()
                     ? empty_prompt
@@ -5068,7 +5068,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             if (slot.n_decoded == 0 && slot.can_speculate()) {
                 static const llama_tokens empty_prompt;
                 // DFlash/DSpark drafts ignore the text stream, so skip it when mtmd is loaded
-                const llama_tokens & spec_prompt = slot.params.speculative.has_dflash_family_stage()
+                const llama_tokens & spec_prompt = slot.params.speculative.has_dflash_family_stage() && !slot.params.speculative.has_composite_stage_chain()
                     ? empty_prompt
                     : slot.uses_mtp() && !slot.params.speculative.has_composite_stage_chain()
                         ? empty_prompt
