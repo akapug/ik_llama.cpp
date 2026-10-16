@@ -262,7 +262,7 @@ static ggml_tensor * dsv4_build_raw_mask_view(
         return dsv4_build_mask_stream_view(ctx, base, std::max<int64_t>(1, n_stream), n_tokens);
     }
 
-    if (n_stream == 1 && mask->ne[0] == raw_k_read_idxs->ne[0]) {
+    if (n_stream == 1 && mask->ne[0] == raw_k_read_idxs->ne[0] && llm.lctx.cparams.n_seq_max == 1) {
         return mask;
     }
 
@@ -446,7 +446,7 @@ static ggml_tensor * dsv4_raw_get_k(
 
     const int64_t n_head_kv = n_embd_gqa/n_embd_head;
 
-    if (n_stream == 1 && lctx->kv_self.n == raw_k_read_idxs->ne[0]) {
+    if (n_stream == 1 && lctx->kv_self.n == raw_k_read_idxs->ne[0] && lctx->cparams.n_seq_max == 1) {
         return ggml_view_3d(ctx, cache, n_embd_head, n_head_kv, n_kv,
                 ggml_row_size(cache->type, n_embd_head),
                 ggml_row_size(cache->type, n_embd_head)*n_head_kv, 0);
@@ -569,6 +569,22 @@ static ggml_tensor * dsv4_comp_get_k(
         result = result == nullptr ? view : ggml_concat(ctx, result, view, 3);
     }
     return result;
+}
+
+// The rows of the one stream a single-token batch reads, for gathering its top-k rows. Top-k
+// indices count from the stream's first row, so with several streams (-np > 1) gathering from
+// the whole cache would read stream 0 for every sequence.
+static ggml_tensor * dsv4_comp_stream_rows(
+        ggml_context * ctx,
+        ggml_tensor  * cache,
+        const llama_context::dsv4_runtime::comp_context & comp,
+        uint32_t       cache_n_stream) {
+    if (cache_n_stream <= 1 || comp.sinfo.n_stream() != 1) {
+        return cache;
+    }
+    const int64_t kv_size = cache->ne[1]/cache_n_stream;
+    return ggml_view_2d(ctx, cache, cache->ne[0], kv_size, cache->nb[1],
+            (size_t) comp.sinfo.strm[0]*(size_t) kv_size*cache->nb[1]);
 }
 
 static ggml_tensor * dsv4_comp_cpy_k(
@@ -908,7 +924,9 @@ static ggml_tensor * dsv4_build_lid_top_k_shared(
         ggml_tensor * cur = ggml_indexer_topk(ctx0, k, q, w, mask, nullptr,
                 GGML_UNARY_OP_RELU, n_top_k);
         if (selected) {
-            selected = ggml_concat(ctx0, selected, cur, 1);
+            // stream-major [n_top_k, n_tokens/n_stream, 1, n_stream], the layout of the unfused
+            // path, the per-stream masks of build_top_k_mask, and ggml_indexer_mask
+            selected = ggml_concat(ctx0, selected, cur, 3);
             cb(selected, "top_k", s);
         } else {
             selected = cur;
@@ -1431,6 +1449,11 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
             extra_k = dsv4_comp_get_k(ctx0, cache, extra_ctx, n_embd_head, cache->ne[1]/n_stream);
             cb(extra_k, "extra_k", il);
         }
+        if (extra_k->ne[3] > 1 && ggml_is_matrix(extra_mask)) {
+            // the plain [n_kv, n_tokens] input (no top-k selection below n_kv) as per-stream rows
+            extra_mask = dsv4_build_raw_mask_view(llm, mask_views, extra_mask, nullptr,
+                    extra_mask->ne[0], n_tokens, extra_k->ne[3], cb, il);
+        }
         if (cparams.flash_attn) {
             extra_mask = dsv4_pad_mask_tokens(ctx0, extra_mask, n_tokens);
         }
@@ -1490,7 +1513,7 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
         if (shared_top_k) {
             if (have_new_top_k || hparams.dsv41_kv_source[il] != hparams.dsv41_kv_source[hparams.dsv41_topk_source[il]]) {
                 if (n_tokens == 1) {
-                    comp_kv = ggml_get_rows_ext(ctx0, comp_kv, shared_top_k, true, false);
+                    comp_kv = ggml_get_rows_ext(ctx0, dsv4_comp_stream_rows(ctx0, comp_kv, slot_ctx, lctx.dsv4.cache.n_stream), shared_top_k, true, false);
                     comp_kv = ggml_reshape_3d(ctx0, comp_kv, comp_kv->ne[0], 1, comp_kv->ne[1]);
                     cb(comp_kv, "comp_kv_getrows", il);
                     comp_mask = ggml_get_rows_ext(ctx0, comp_mask, shared_top_k, true, true);
@@ -1529,7 +1552,7 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
                 // When we are dealing with a single token, we can just use ggml_get_rows_ext to get the
                 // selected rows from the CSA cache and setup the corresponding mask. This makes the
                 // raw_kv and csa_kv concetenation much less expensive for long context.
-                csa_kv = ggml_get_rows_ext(ctx0, csa_kv, top_k, true, false);
+                csa_kv = ggml_get_rows_ext(ctx0, dsv4_comp_stream_rows(ctx0, csa_kv, lctx.dsv4.csa_ctx, lctx.dsv4.cache.n_stream), top_k, true, false);
                 csa_kv = ggml_reshape_3d(ctx0, csa_kv, csa_kv->ne[0], 1, csa_kv->ne[1]);
                 cb(csa_kv, "csa_kv_getrows", il);
                 csa_mask = ggml_get_rows_ext(ctx0, csa_mask, top_k, true, true);
@@ -2380,6 +2403,11 @@ static ggml_tensor * ds4_attention_v41(ggml_cgraph * gf, ggml_context * ctx0, ll
             extra_k = dsv4_comp_get_k(ctx0, cache, extra_ctx, n_embd_head, cache->ne[1]/n_stream);
             cb(extra_k, "extra_k", il);
         }
+        if (extra_k->ne[3] > 1 && ggml_is_matrix(extra_mask)) {
+            // the plain [n_kv, n_tokens] input (no top-k selection below n_kv) as per-stream rows
+            extra_mask = dsv4_build_raw_mask_view(llm, mask_views, extra_mask, nullptr,
+                    extra_mask->ne[0], n_tokens, extra_k->ne[3], cb, il);
+        }
         if (cparams.flash_attn) {
             extra_mask = dsv4_pad_mask_tokens(ctx0, extra_mask, n_tokens);
         }
@@ -2437,7 +2465,7 @@ static ggml_tensor * ds4_attention_v41(ggml_cgraph * gf, ggml_context * ctx0, ll
                 if (topk_carry) { *topk_carry = top_k; }
             }
             if (n_tokens == 1) {
-                csa_kv = ggml_get_rows_ext(ctx0, csa_kv, top_k, true, false);
+                csa_kv = ggml_get_rows_ext(ctx0, dsv4_comp_stream_rows(ctx0, csa_kv, lctx.dsv4.csa_ctx, lctx.dsv4.cache.n_stream), top_k, true, false);
                 csa_kv = ggml_reshape_3d(ctx0, csa_kv, csa_kv->ne[0], 1, csa_kv->ne[1]);
                 cb(csa_kv, "csa_kv_getrows", il);
                 csa_mask = ggml_get_rows_ext(ctx0, csa_mask, top_k, true, true);
@@ -2472,7 +2500,7 @@ static ggml_tensor * ds4_attention_v41(ggml_cgraph * gf, ggml_context * ctx0, ll
                 if (topk_carry) { *topk_carry = top_k; }
             }
             if (n_tokens == 1) {
-                hca_kv = ggml_get_rows_ext(ctx0, hca_kv, top_k, true, false);
+                hca_kv = ggml_get_rows_ext(ctx0, dsv4_comp_stream_rows(ctx0, hca_kv, lctx.dsv4.hca_ctx, lctx.dsv4.cache.n_stream), top_k, true, false);
                 hca_kv = ggml_reshape_3d(ctx0, hca_kv, hca_kv->ne[0], 1, hca_kv->ne[1]);
                 cb(hca_kv, "hca_kv_getrows", il);
                 hca_mask = ggml_get_rows_ext(ctx0, hca_mask, top_k, true, true);

@@ -431,6 +431,14 @@ static bool dsv4_build_raw_context(
             raw.read_dst_idxs.push_back((int32_t) row);
             ++count;
         }
+        if (!compacted && lctx.cparams.n_seq_max > 1) {
+            // With several sequences, freed cells are reused out of position order. The graph's
+            // sliding-window view takes the last gathered rows as the newest, so gather by position.
+            auto & idxs = raw.sinfo_read.idxs[s];
+            std::stable_sort(idxs.begin(), idxs.end(), [&kv](uint32_t x, uint32_t y) {
+                return kv.cells[x].pos < kv.cells[y].pos;
+            });
+        }
         raw.read_counts.push_back(count);
         raw.n_kv = std::max<int64_t>(raw.n_kv, count);
     }
@@ -482,8 +490,41 @@ static bool dsv4_build_raw_context(
     if (raw.n_kv > 0) {
         raw.read_dst_idxs.clear();
         const size_t read_rows = GGML_PAD((size_t) raw.n_kv, 256u);
-        for (size_t s = 0; s < raw.sinfo_read.n_stream(); ++s) {
+        const size_t n_read_stream = raw.sinfo_read.n_stream();
+        for (size_t s = 0; s < n_read_stream; ++s) {
             const auto & rows = raw.sinfo_read.idxs[s];
+            if (n_read_stream > 1 && !compacted) {
+                // A multi-sequence batch. Padding a shorter stream by repeating its last row would
+                // make that row visible n_kv - count extra times, and the sliding-window view (the
+                // last rows of each stream) would miss its recent rows. Instead front-fill with a
+                // cell of another stream, which the KQ mask hides from this stream's tokens, and put
+                // the stream's rows, in position order, at the end of the visible n_kv.
+                const llama_seq_id seq_id = read_seq_ids[s];
+                int32_t hidden = -1;
+                for (size_t o = 0; o < n_read_stream && hidden < 0; ++o) {
+                    for (uint32_t slot : raw.sinfo_read.idxs[o]) {
+                        if (!kv.cells[slot].has_seq_id(seq_id)) {
+                            hidden = (int32_t) slot;
+                            break;
+                        }
+                    }
+                }
+                if (hidden >= 0 || rows.size() == (size_t) raw.n_kv) {
+                    for (size_t i = rows.size(); i < (size_t) raw.n_kv; ++i) {
+                        raw.read_dst_idxs.push_back(hidden);
+                    }
+                    // rows are in position order (sorted above)
+                    for (uint32_t slot : rows) {
+                        raw.read_dst_idxs.push_back((int32_t) slot);
+                    }
+                    // beyond n_kv the graph masks every column
+                    const int32_t tail = rows.empty() ? 0 : (int32_t) rows.back();
+                    for (size_t i = (size_t) raw.n_kv; i < read_rows; ++i) {
+                        raw.read_dst_idxs.push_back(tail);
+                    }
+                    continue;
+                }
+            }
             for (uint32_t slot : rows) {
                 raw.read_dst_idxs.push_back((int32_t) slot);
             }
