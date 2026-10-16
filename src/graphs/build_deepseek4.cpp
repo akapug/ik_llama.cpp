@@ -1745,6 +1745,18 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                     ? selected_experts->ne[0]
                     : n_expert_used;
 
+            // LLAMA_MOE_OVERLAP: build the shared expert first and let llm_build_moe_ffn place it after the routed experts
+            ggml_tensor * ffn_shexp = nullptr;
+            if (moe_overlap()) {
+                ffn_shexp = llm_build_ffn(ctx0, lctx, nullptr, cur,
+                        model.layers[il].ffn_up_shexp,   nullptr, nullptr,
+                        model.layers[il].ffn_gate_shexp, nullptr, nullptr,
+                        model.layers[il].ffn_down_shexp, nullptr, nullptr,
+                        nullptr,
+                        LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+                moe_side = ffn_shexp;
+            }
+
             auto moe_out = llm_build_moe_ffn(ctx0, lctx, cur,
                         model.layers[il].ffn_gate_inp,
                         nullptr,
@@ -1762,15 +1774,18 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                         cb, il, gf, false, model.layers[il].ffn_up_gate_exps, nullptr, nullptr, nullptr,
                         selected_experts);
 
+            moe_side = nullptr;
             ggml_build_forward_expand(gf, moe_out);
             cb(moe_out, "ffn_moe_out", il);
 
-            ggml_tensor * ffn_shexp = llm_build_ffn(ctx0, lctx, nullptr, cur,
-                    model.layers[il].ffn_up_shexp,   nullptr, nullptr,
-                    model.layers[il].ffn_gate_shexp, nullptr, nullptr,
-                    model.layers[il].ffn_down_shexp, nullptr, nullptr,
-                    nullptr,
-                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+            if (!ffn_shexp) {
+                ffn_shexp = llm_build_ffn(ctx0, lctx, nullptr, cur,
+                        model.layers[il].ffn_up_shexp,   nullptr, nullptr,
+                        model.layers[il].ffn_gate_shexp, nullptr, nullptr,
+                        model.layers[il].ffn_down_shexp, nullptr, nullptr,
+                        nullptr,
+                        LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+            }
             cb(ffn_shexp, "ffn_shexp", il);
 
             cur = ggml_add(ctx0, moe_out, ffn_shexp);
@@ -2008,6 +2023,16 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
                 layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &post, &comb, cb, il,
                 hc_attn_pre, hc_lag ? &hc_pre_mix : nullptr);
         cur = llm_build_norm(ctx0, cur, hparams, layer.ffn_norm, nullptr, LLM_NORM_RMS, cb, il);
+        // LLAMA_MOE_OVERLAP: shared expert built first, placed by llm_build_moe_ffn after the routed experts
+        auto build_shexp = [&]() {
+            return llm_build_ffn(ctx0, lctx, nullptr, cur,
+                layer.ffn_up_shexp, nullptr, nullptr,
+                layer.ffn_gate_shexp, nullptr, nullptr,
+                layer.ffn_down_shexp, nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, false, false);
+        };
+        ggml_tensor * shexp = moe_overlap() ? build_shexp() : nullptr;
+        moe_side = shexp;
         ggml_tensor * moe = llm_build_moe_ffn(ctx0, lctx, cur,
                 layer.ffn_gate_inp, nullptr,
                 layer.ffn_up_exps, nullptr,
@@ -2018,11 +2043,10 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
                 LLM_FFN_SILU, hparams.expert_weights_norm, true, hparams.expert_weights_scale,
                 (llm_expert_gating_func_type) hparams.expert_gating_func,
                 cb, il, gf, false, layer.ffn_up_gate_exps, nullptr, nullptr, nullptr, nullptr);
-        ggml_tensor * shexp = llm_build_ffn(ctx0, lctx, nullptr, cur,
-                layer.ffn_up_shexp, nullptr, nullptr,
-                layer.ffn_gate_shexp, nullptr, nullptr,
-                layer.ffn_down_shexp, nullptr, nullptr,
-                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, false, false);
+        moe_side = nullptr;
+        if (!shexp) {
+            shexp = build_shexp();
+        }
         cur = ggml_add(ctx0, moe, shexp);
         inpL = build_mhc_post(cur, post, residual, comb, n_embd, hparams.dsv4_hc_mult, true);
     }

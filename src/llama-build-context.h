@@ -111,6 +111,14 @@ struct llm_build_context {
     struct ggml_tensor * last_sparse_mask     = nullptr;
     struct ggml_tensor * dsa_tg_fast_mask     = nullptr;
 
+    // LLAMA_MOE_OVERLAP=1 (research): work of a MoE layer that does not depend on the routed experts
+    // (the shared expert) is handed to llm_build_moe_ffn here, which places it in graph order right after the routed
+    // expert matmuls and before their combine, so a CPU-expert split is followed by a device split that opens with
+    // work the device can run while the CPU computes (see GGML_SCHED_OVERLAP in ggml-backend.cpp). Order only: the
+    // values are unchanged. Static (llm_build_moe_ffn is static); thread_local, as graphs build on the caller's thread.
+    static inline thread_local struct ggml_tensor * moe_side = nullptr;
+    static bool moe_overlap();
+
     // TODO: consider making the entire interface noexcept
     llm_build_context(
         llama_context  & lctx,
