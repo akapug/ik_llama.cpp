@@ -1632,7 +1632,8 @@ llm_expert_gating_func_type   gating_op,
             lctx.cparams.min_experts < n_expert_used && n_expert_used < n_expert &&
             (lctx.cparams.ser_max_batch <= 0 || n_tokens <= lctx.cparams.ser_max_batch) &&
             !weight_before_ffn && !lctx.moe_cache &&
-            !up_exps_b && !gate_exps_b && !down_exps_b && !up_gate_exps_b;
+            !up_exps_b && !gate_exps_b && !down_exps_b && !up_gate_exps_b &&
+            !(lctx.hot_experts && lctx.hot_experts->layer(il, n_tokens)); // partition maps cannot look up a -1 slot
     const bool use_mmad = lctx.cparams.fused_mmad || use_ser;
 
     // Union cap for speculative verify (LLAMA_UNION_CAP=U[,G], research): the tokens of one group may route only to the
@@ -1726,7 +1727,7 @@ llm_expert_gating_func_type   gating_op,
     ggml_tensor * cached_up = nullptr;
     ggml_tensor * cached_gate = nullptr;
     ggml_tensor * cached_down = nullptr;
-    if (lctx.moe_cache && lctx.lora_adapters.empty()) {
+    if (lctx.moe_cache && lctx.lora_adapters.empty() && down_exps) {
         ggml_tensor * slot_map = lctx.moe_cache->get_slot_map(il, n_tokens, n_expert_used);
         cached_up_gate = lctx.moe_cache->get_experts(up_gate_exps);
         cached_up = lctx.moe_cache->get_experts(up_exps);
@@ -1754,10 +1755,10 @@ llm_expert_gating_func_type   gating_op,
 
     cur = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
 
-    // Static GPU hot-expert set (LLAMA_HOT_EXPERTS): for small batches the routed experts that have a
-    // copy in the GPU bank run there (misses get id -1, which the CUDA decode kernels skip), the rest run
-    // on the CPU from the full tensors (hits get id -1, which the CPU kernels zero-fill); the sum of the
-    // two outputs equals the single-path expert output row by row.
+    // Expert partitions (llama_hot_experts): split expert tensors (every batch size) and the static GPU hot-expert set
+    // (LLAMA_HOT_EXPERTS, small batches). Each partition runs the usual up/gate + down chain with its own ids
+    // (expert -> index in the partition, -1 elsewhere); negative ids give zero rows (CPU kernels, CUDA decode and
+    // mmq_id kernels), so the sum of the partition outputs equals the single-path expert output row by row.
     // LLAMA_MOE_OVERLAP: after the routed expert matmuls are in the graph, add the side work (shared expert) and the
     // routing weights, so they come before the combine that waits for the experts
     const bool overlap = moe_overlap() && graph != nullptr && moe_side != nullptr;
@@ -1767,21 +1768,22 @@ llm_expert_gating_func_type   gating_op,
         moe_side = nullptr;
     };
     ggml_tensor * experts = nullptr;
-    llama_hot_experts::layer_view hot;
-    if (!cache_ids && lctx.hot_experts && lctx.lora_adapters.empty() && !weight_before_ffn &&
+    const auto * parts = !cache_ids && lctx.hot_experts ? lctx.hot_experts->layer(il, n_tokens) : nullptr;
+    const bool split_layer = up_exps == nullptr && gate_exps == nullptr && up_gate_exps == nullptr && down_exps == nullptr;
+    if (parts && !(lctx.lora_adapters.empty() && !weight_before_ffn &&
             !up_exps_b && !gate_exps_b && !down_exps_b && !up_gate_exps_b && !down_exps_s &&
-            (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU || type_op == LLM_FFN_SWIGLU_OAI) &&
-            lctx.hot_experts->layer(il, n_tokens, hot)) {
+            (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU || type_op == LLM_FFN_SWIGLU_OAI))) {
+        if (split_layer) {
+            GGML_ABORT("layer %d: split expert tensors do not support LoRA, expert biases/scales or weight-before-FFN", il);
+        }
+        parts = nullptr;
+    }
+    if (split_layer && !parts) {
+        GGML_ABORT("layer %d: split expert tensors but no partition plan (moe cache?)", il);
+    }
+    if (parts) {
         ggml_tensor * flat = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx, selected_experts);
         flat = ggml_reshape_1d(ctx, flat, n_expert_used*n_tokens);
-        ggml_tensor * hot_ids  = ggml_get_rows(ctx, hot.hot_map, flat);
-        ggml_tensor * cold_ids = ggml_get_rows(ctx, hot.cold_map, flat);
-        ggml_backend_sched_set_tensor_backend(lctx.sched, hot_ids, hot.backend);
-        ggml_backend_sched_set_tensor_backend(lctx.sched, cold_ids, hot.cpu);
-        hot_ids  = ggml_reshape_2d(ctx, hot_ids,  n_expert_used, n_tokens);
-        cold_ids = ggml_reshape_2d(ctx, cold_ids, n_expert_used, n_tokens);
-        cb(hot_ids, "ffn_moe_hot_ids", il);
-        cb(cold_ids, "ffn_moe_cold_ids", il);
         const ggml_unary_op uop = type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
                                   type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI;
         const float limit = lctx.model.swiglu_limit(il, false);
@@ -1791,48 +1793,52 @@ llm_expert_gating_func_type   gating_op,
             *((float *)(r->op_params + 1)) = limit;
             return r;
         };
-        // w_* are the tensors to multiply (bank or full), the originals select the hadamard rotation
-        auto path = [&](ggml_tensor * w_up, ggml_tensor * w_gate, ggml_tensor * w_up_gate, ggml_tensor * w_down,
-                        ggml_tensor * ids, const char * tag) {
+        auto path = [&](const llama_hot_experts::part & p, const std::string & tag) {
+            ggml_tensor * ids = ggml_get_rows(ctx, p.map, flat);
+            ggml_backend_sched_set_tensor_backend(lctx.sched, ids, p.backend);
+            ids = ggml_reshape_2d(ctx, ids, n_expert_used, n_tokens);
+            cb(ids, ("ffn_moe_ids_" + tag).c_str(), il);
             ggml_tensor * par;
-            if (w_up_gate) {
+            if (p.up_gate) {
                 par = type_op == LLM_FFN_SWIGLU_OAI ?
-                    ggml_moe_up_gate_ext(ctx, w_up_gate, nullptr, cur, ids, nullptr, nullptr, uop) :
-                    ggml_moe_up_gate(ctx, w_up_gate, nullptr, cur, ids, uop);
+                    ggml_moe_up_gate_ext(ctx, p.up_gate, nullptr, cur, ids, nullptr, nullptr, uop) :
+                    ggml_moe_up_gate(ctx, p.up_gate, nullptr, cur, ids, uop);
                 *((float *)(par->op_params + 1)) = limit;
-            } else if (lctx.cparams.fused_moe_up_gate && w_up->type == w_gate->type) {
+            } else if (lctx.cparams.fused_moe_up_gate && p.up->type == p.gate->type) {
                 par = type_op == LLM_FFN_SWIGLU_OAI ?
-                    ggml_moe_up_gate_ext(ctx, w_up, w_gate, cur, ids, nullptr, nullptr, uop) :
-                    ggml_moe_up_gate(ctx, w_up, w_gate, cur, ids, uop);
+                    ggml_moe_up_gate_ext(ctx, p.up, p.gate, cur, ids, nullptr, nullptr, uop) :
+                    ggml_moe_up_gate(ctx, p.up, p.gate, cur, ids, uop);
                 *((float *)(par->op_params + 1)) = limit;
             } else {
-                ggml_tensor * up   = llm_build_lora_mm_id(lctx, ctx, up_exps,   cur, ids, w_up,   nullptr);
-                ggml_tensor * gate = llm_build_lora_mm_id(lctx, ctx, gate_exps, cur, ids, w_gate, nullptr);
+                // the original full tensors (if any) select the hadamard rotation; split partitions have none
+                ggml_tensor * up   = llm_build_lora_mm_id(lctx, ctx, up_exps   ? up_exps   : p.up,   cur, ids, p.up,   nullptr);
+                ggml_tensor * gate = llm_build_lora_mm_id(lctx, ctx, gate_exps ? gate_exps : p.gate, cur, ids, p.gate, nullptr);
                 if (graph) {
                     ggml_build_forward_expand(graph, up);
                     ggml_build_forward_expand(graph, gate);
                 }
                 par = unary(gate, up);
             }
-            cb(par, (std::string("ffn_moe_gate_par_") + tag).c_str(), il);
-            ggml_tensor * out = llm_build_lora_mm_id(lctx, ctx, down_exps, par, ids, w_down, nullptr);
-            cb(out, (std::string("ffn_moe_down_") + tag).c_str(), il);
+            cb(par, ("ffn_moe_gate_par_" + tag).c_str(), il);
+            ggml_tensor * out = llm_build_lora_mm_id(lctx, ctx, down_exps ? down_exps : p.down, par, ids, p.down, nullptr);
+            cb(out, ("ffn_moe_down_" + tag).c_str(), il);
             return out;
         };
-        auto * hk = lctx.hot_experts.get();
-        ggml_tensor * cold_out = nullptr;
-        if (overlap) {
-            // CPU part first, then the side work and the GPU hot experts: they open the device split after it
-            cold_out = path(up_exps, gate_exps, up_gate_exps, down_exps, cold_ids, "cold");
-            ggml_build_forward_expand(graph, cold_out);
-            expand_side();
+        // model partitions (CPU part) first, then the side work and the GPU banks: they open the device split after it
+        ggml_backend_t pin = nullptr;
+        bool side_done = !overlap;
+        for (const auto & p : *parts) {
+            if (p.bank && !side_done) {
+                expand_side();
+                side_done = true;
+            }
+            ggml_tensor * out = path(p, std::string(p.bank ? "bank_" : "") + p.tag);
+            if (overlap && !p.bank) ggml_build_forward_expand(graph, out);
+            if (p.bank) pin = p.backend;
+            experts = experts ? ggml_add(ctx, experts, out) : out;
         }
-        ggml_tensor * hot_out  = path(hk->bank(up_exps), hk->bank(gate_exps), hk->bank(up_gate_exps), hk->bank(down_exps), hot_ids, "hot");
-        if (!cold_out) {
-            cold_out = path(up_exps, gate_exps, up_gate_exps, down_exps, cold_ids, "cold");
-        }
-        experts = ggml_add(ctx, hot_out, cold_out);
-        ggml_backend_sched_set_tensor_backend(lctx.sched, experts, hot.backend);
+        if (!side_done) expand_side();
+        if (pin) ggml_backend_sched_set_tensor_backend(lctx.sched, experts, pin);
     }
 
     if (!experts) {
@@ -2032,7 +2038,7 @@ llm_expert_gating_func_type   gating_op,
 
     auto split_up_exps    = up_exps ? (ggml_split_tensor_t *)up_exps->extra : nullptr;
     auto split_gate_exps  = gate_exps ? (ggml_split_tensor_t *)gate_exps->extra : nullptr;
-    auto split_down_exps  = (ggml_split_tensor_t *)down_exps->extra;
+    auto split_down_exps  = down_exps ? (ggml_split_tensor_t *)down_exps->extra : nullptr;
     auto split_up_shexp   = up_shexp   ? (ggml_split_tensor_t *)up_shexp->extra   : nullptr;
     auto split_gate_shexp = gate_shexp ? (ggml_split_tensor_t *)gate_shexp->extra : nullptr;
     auto split_down_shexp = down_shexp ? (ggml_split_tensor_t *)down_shexp->extra : nullptr;

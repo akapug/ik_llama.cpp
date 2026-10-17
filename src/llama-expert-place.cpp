@@ -79,16 +79,32 @@ int parse_layer_key(const std::string & key) {
     return std::stoi(k);
 }
 
-std::vector<ggml_tensor *> layer_expert_tensors(const llama_layer & l) {
-    std::vector<ggml_tensor *> out;
+// expert tensors of a layer with the expert ids they hold: local[e] = index of global expert e in the tensor, or -1
+// (identity for full tensors; split layers have one set of tensors per partition)
+struct layer_expert_tensor {
+    ggml_tensor * t;
+    std::vector<int> local;
+};
+
+std::vector<layer_expert_tensor> layer_expert_tensors(const llama_layer & l) {
+    std::vector<layer_expert_tensor> out;
     for (ggml_tensor * t : { l.ffn_up_gate_exps, l.ffn_up_exps, l.ffn_gate_exps, l.ffn_down_exps }) {
-        if (t) out.push_back(t);
+        if (!t) continue;
+        std::vector<int> local(t->ne[2]);
+        for (int e = 0; e < (int) local.size(); ++e) local[e] = e;
+        out.push_back({ t, std::move(local) });
+    }
+    const int n_exp = (int) l.ffn_exps_part_map.size() / 2;
+    for (const auto & p : l.ffn_exps_parts) {
+        std::vector<int> local(n_exp, -1);
+        for (int e = 0; e < n_exp; ++e) if (l.ffn_exps_part_map[e] == p.tag) local[e] = l.ffn_exps_part_map[n_exp + e];
+        for (ggml_tensor * t : { p.up_gate, p.up, p.gate, p.down }) if (t) out.push_back({ t, local });
     }
     return out;
 }
 
 bool expert_contiguous(const ggml_tensor * t) {
-    return t->ne[3] == 1 && t->ne[2] > 1 && (size_t) t->nb[2] * (size_t) t->ne[2] == ggml_nbytes(t);
+    return t->ne[3] == 1 && t->ne[2] >= 1 && (size_t) t->nb[2] * (size_t) t->ne[2] == ggml_nbytes(t);
 }
 
 bool is_host_weight(const ggml_tensor * t) {
@@ -202,7 +218,8 @@ void llama_expert_numa_apply(const llama_model & model, bool use_mmap) {
     const unsigned long maxnode = k_max_nodes;
     size_t n_tensors = 0, n_skipped = 0;
     for (size_t il = 0; il < model.layers.size(); ++il) {
-        for (ggml_tensor * t : layer_expert_tensors(model.layers[il])) {
+        for (const auto & lt : layer_expert_tensors(model.layers[il])) {
+            ggml_tensor * t = lt.t;
             std::vector<const rule *> mine;
             for (const auto & r : rules) {
                 if (r.layer == (int) il || (r.layer < 0 && r.key == t->name)) mine.push_back(&r);
@@ -217,7 +234,14 @@ void llama_expert_numa_apply(const llama_model & model, bool use_mmap) {
             const size_t nb2 = t->nb[2];
             std::vector<int> pol(n_exp, -1);
             for (const rule * r : mine) {
-                for (int e : parse_ids(r->experts, n_exp, std::string(path) + ":" + std::to_string(r->line))) pol[e] = r->policy;
+                const std::string where = std::string(path) + ":" + std::to_string(r->line);
+                if (r->layer < 0) {
+                    // a rule naming the tensor counts experts inside it
+                    for (int e : parse_ids(r->experts, n_exp, where)) pol[e] = r->policy;
+                } else {
+                    // a layer rule counts the model's expert ids; a split layer maps them into its partitions
+                    for (int e : parse_ids(r->experts, (int) lt.local.size(), where)) if (lt.local[e] >= 0) pol[lt.local[e]] = r->policy;
+                }
             }
             if (std::all_of(pol.begin(), pol.end(), [](int p) { return p < 0; })) continue;
             ++n_tensors;
@@ -347,16 +371,21 @@ void llama_expert_numa_report(const llama_model & model) {
 }
 
 //
-// Static GPU hot-expert set
+// Expert partitions: split model tensors + static GPU hot-expert set
 //
+
+const char * llama_expert_part_tag(int tag) {
+    static const char * tags[LLAMA_EXPERT_PART_MAX] = { "hot", "warm", "cold", "p3", "p4", "p5", "p6", "p7" };
+    return tag >= 0 && tag < LLAMA_EXPERT_PART_MAX ? tags[tag] : "?";
+}
 
 struct llama_hot_experts::impl {
     struct layer {
+        std::vector<part> small; // batches <= max_batch (with GPU banks)
+        std::vector<part> large; // larger batches; empty for an unsplit layer (single path)
         bool active = false;
-        layer_view view;
     };
     std::vector<layer> layers;
-    std::unordered_map<const ggml_tensor *, ggml_tensor *> banks;
     std::vector<ggml_context_ptr> ctxs;
     std::vector<ggml_backend_buffer_ptr> bufs;
     int64_t max_batch = 8;
@@ -364,12 +393,57 @@ struct llama_hot_experts::impl {
 
 llama_hot_experts::~llama_hot_experts() = default;
 
+namespace {
+
+// a source of experts in a layer: the full tensors, or one partition of a split layer
+struct expert_source {
+    llama_hot_experts::part w;   // tensors (map unset)
+    std::vector<int32_t> local;  // global expert id -> index in these tensors, or -1
+    std::vector<int> banked;     // global expert ids copied to the GPU bank of this source
+};
+
+std::vector<expert_source> layer_sources(const llama_layer & l, int n_expert) {
+    std::vector<expert_source> out;
+    if (!l.ffn_exps_parts.empty()) {
+        for (const auto & p : l.ffn_exps_parts) {
+            expert_source s;
+            s.w.up = p.up; s.w.gate = p.gate; s.w.up_gate = p.up_gate; s.w.down = p.down;
+            s.w.tag = llama_expert_part_tag(p.tag);
+            s.local.assign(n_expert, -1);
+            for (int e = 0; e < n_expert; ++e) {
+                if (l.ffn_exps_part_map[e] == p.tag) s.local[e] = l.ffn_exps_part_map[n_expert + e];
+            }
+            out.push_back(std::move(s));
+        }
+    } else if (l.ffn_down_exps) {
+        expert_source s;
+        s.w.up = l.ffn_up_exps; s.w.gate = l.ffn_gate_exps; s.w.up_gate = l.ffn_up_gate_exps; s.w.down = l.ffn_down_exps;
+        s.w.tag = "cold";
+        s.local.resize(n_expert);
+        for (int e = 0; e < n_expert; ++e) s.local[e] = e;
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
+std::vector<ggml_tensor *> part_tensors(const llama_hot_experts::part & p) {
+    std::vector<ggml_tensor *> out;
+    for (ggml_tensor * t : { p.up_gate, p.up, p.gate, p.down }) if (t) out.push_back(t);
+    return out;
+}
+
+} // namespace
+
 std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model & model,
-        const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts) {
+        const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, bool allow_banks) {
+    const bool split = std::any_of(model.layers.begin(), model.layers.end(), [](const llama_layer & l) { return !l.ffn_exps_parts.empty(); });
     const char * path = getenv("LLAMA_HOT_EXPERTS");
-    if (!path || !*path) return nullptr;
-    std::ifstream in(path);
-    if (!in) throw std::runtime_error(std::string("cannot read LLAMA_HOT_EXPERTS file ") + path);
+    if (path && !*path) path = nullptr;
+    if (path && !allow_banks) {
+        LLAMA_LOG_WARN("llama_hot_experts: --moe-cache-mib is active; LLAMA_HOT_EXPERTS is ignored\n");
+        path = nullptr;
+    }
+    if (!split && !path) return nullptr;
     if (backends.size() != bufts.size()) throw std::runtime_error("hot experts: backend metadata is inconsistent");
 
     ggml_backend_t cpu = nullptr;
@@ -379,128 +453,196 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
     auto res = std::unique_ptr<llama_hot_experts>(new llama_hot_experts());
     auto & p = *(res->pimpl = std::make_unique<impl>());
     p.layers.resize(model.layers.size());
-    // The CUDA fast decode kernels skip negative ids (rows stay zero); larger batches take
-    // paths that do not, so the two-path graph is limited to at most 8 tokens.
+    // The CUDA fast decode kernels skip negative ids (rows stay zero); the two-path graph with GPU banks is limited
+    // to small batches (prefill reads the model's own tensors).
     if (const char * mb = getenv("LLAMA_HOT_EXPERTS_MAX_BATCH")) p.max_batch = std::clamp<int64_t>(atoi(mb), 0, 8);
+    const int n_exp = (int) model.hparams.n_expert;
 
     std::map<int, std::vector<int>> hot;
-    std::string line;
-    for (int ln = 1; std::getline(in, line); ++ln) {
-        const auto hash = line.find('#');
-        if (hash != std::string::npos) line = line.substr(0, hash);
-        line = trim(line);
-        if (line.empty()) continue;
-        std::stringstream ss(line);
-        std::string key, ids;
-        ss >> key >> ids;
-        const int il = parse_layer_key(key);
-        if (il >= (int) model.layers.size() && !ids.empty()) {
-            // the file names a layer this model lacks: it was written for another model (e.g. the target, while this
-            // context loads a small speculative draft that reads the same env) -> no hot set for this model
-            LLAMA_LOG_WARN("llama_hot_experts: %s:%d names blk.%d but this model has %d layers; hot experts inactive for this model\n",
-                path, ln, il, (int) model.layers.size());
-            return nullptr;
+    if (path) {
+        std::ifstream in(path);
+        if (!in) throw std::runtime_error(std::string("cannot read LLAMA_HOT_EXPERTS file ") + path);
+        std::string line;
+        for (int ln = 1; std::getline(in, line); ++ln) {
+            const auto hash = line.find('#');
+            if (hash != std::string::npos) line = line.substr(0, hash);
+            line = trim(line);
+            if (line.empty()) continue;
+            std::stringstream ss(line);
+            std::string key, ids;
+            ss >> key >> ids;
+            const int il = parse_layer_key(key);
+            if (il >= (int) model.layers.size() && !ids.empty()) {
+                // the file names a layer this model lacks: it was written for another model (e.g. the target, while this
+                // context loads a small speculative draft that reads the same env) -> no hot set for this model
+                LLAMA_LOG_WARN("llama_hot_experts: %s:%d names blk.%d but this model has %d layers; hot experts inactive for this model\n",
+                    path, ln, il, (int) model.layers.size());
+                hot.clear();
+                break;
+            }
+            if (il < 0 || ids.empty()) {
+                throw std::runtime_error(std::string(path) + ":" + std::to_string(ln) + ": expected 'blk.N<TAB>expert,list'");
+            }
+            const auto parsed = parse_ids(ids, INT_MAX, std::string(path) + ":" + std::to_string(ln));
+            if (!parsed.empty() && *std::max_element(parsed.begin(), parsed.end()) >= n_exp) {
+                // the file names an expert this model lacks: written for another model (a speculative draft with fewer
+                // experts reads the same env) -> no hot set for this model, as for a missing layer above
+                LLAMA_LOG_WARN("llama_hot_experts: %s:%d names expert %d but this model has %d experts; hot experts inactive for this model\n",
+                    path, ln, *std::max_element(parsed.begin(), parsed.end()), n_exp);
+                hot.clear();
+                break;
+            }
+            auto & v = hot[il];
+            v.insert(v.end(), parsed.begin(), parsed.end());
         }
-        if (il < 0 || ids.empty()) {
-            throw std::runtime_error(std::string(path) + ":" + std::to_string(ln) + ": expected 'blk.N<TAB>expert,list'");
-        }
-        const int n_exp = (int) model.hparams.n_expert;
-        const auto parsed = parse_ids(ids, INT_MAX, std::string(path) + ":" + std::to_string(ln));
-        if (!parsed.empty() && *std::max_element(parsed.begin(), parsed.end()) >= n_exp) {
-            // the file names an expert this model lacks: written for another model (a speculative draft with fewer
-            // experts reads the same env) -> no hot set for this model, as for a missing layer above
-            LLAMA_LOG_WARN("llama_hot_experts: %s:%d names expert %d but this model has %d experts; hot experts inactive for this model\n",
-                path, ln, *std::max_element(parsed.begin(), parsed.end()), n_exp);
-            return nullptr;
-        }
-        auto & v = hot[il];
-        v.insert(v.end(), parsed.begin(), parsed.end());
+        if (hot.empty()) path = nullptr;
+        if (!split && !path) return nullptr;
     }
 
-    struct pending { int il; int device; std::vector<int> experts; std::vector<ggml_tensor *> src; };
-    std::vector<pending> todo;
-    for (auto & [il, v] : hot) {
-        std::sort(v.begin(), v.end());
-        v.erase(std::unique(v.begin(), v.end()), v.end());
-        auto src = layer_expert_tensors(model.layers[il]);
-        if (src.empty() || v.empty()) continue;
-        const bool ok = std::all_of(src.begin(), src.end(), [&](const ggml_tensor * t) {
-            return is_host_weight(t) && expert_contiguous(t) && t->ne[2] == src[0]->ne[2];
-        });
-        if (!ok) {
-            LLAMA_LOG_WARN("llama_hot_experts: layer %d experts are not all host-resident and expert-contiguous; layer skipped\n", il);
-            continue;
+    // backend that runs a partition: its weights' backend (host buffers -> CPU)
+    auto backend_of = [&](const ggml_tensor * t) -> int {
+        if (!t->buffer || ggml_backend_buffer_is_host(t->buffer)) {
+            for (size_t i = 0; i < backends.size(); ++i) if (backends[i] == cpu) return (int) i;
         }
-        int device = -1;
-        if (il < (int) model.default_layer_device.size() && model.default_layer_device[il] >= 0) {
-            const auto * buft = model.default_buffer_type_offload(model.default_layer_device[il]);
-            for (size_t i = 0; i < bufts.size(); ++i) if (bufts[i] == buft && !ggml_backend_is_cpu(backends[i])) device = (int) i;
+        for (size_t i = 0; i < backends.size(); ++i) {
+            if (!ggml_backend_is_cpu(backends[i]) && ggml_backend_supports_buft(backends[i], ggml_backend_buffer_get_type(t->buffer))) return (int) i;
         }
-        if (device < 0) {
-            for (size_t i = 0; i < backends.size() && device < 0; ++i) if (!ggml_backend_is_cpu(backends[i])) device = (int) i;
-        }
-        if (device < 0) throw std::runtime_error("hot experts: no GPU backend");
-        todo.push_back({ il, device, v, src });
-    }
-    if (todo.empty()) {
-        LLAMA_LOG_WARN("llama_hot_experts: %s selects no eligible layer; hot experts inactive\n", path);
-        return nullptr;
-    }
+        throw std::runtime_error(std::string("hot experts: no backend for ") + t->name);
+    };
 
-    // one metadata context per GPU device for the banks + hot maps, one host context for the cold maps
-    std::map<int, ggml_context *> dev_ctx;
-    auto new_ctx = [&](size_t n) {
-        ggml_init_params ip = { n * ggml_tensor_overhead(), nullptr, true };
+    struct bank_fill { ggml_tensor * bank; const ggml_tensor * src; std::vector<int32_t> slices; };
+    struct map_fill  { ggml_tensor * map; std::vector<int32_t> values; };
+    std::vector<bank_fill> bank_fills;
+    std::vector<map_fill> map_fills;
+    std::map<int, ggml_context *> ctx_of;       // backend index -> metadata context (maps + banks)
+    std::map<int, ggml_backend_buffer_type_t> buft_of;
+    auto new_ctx = [&](int b, ggml_backend_buffer_type_t buft) {
+        auto it = ctx_of.find(b);
+        if (it != ctx_of.end()) return it->second;
+        ggml_init_params ip = { 8 * LLAMA_EXPERT_PART_MAX * model.layers.size() * ggml_tensor_overhead(), nullptr, true };
         ggml_context * c = ggml_init(ip);
         if (!c) throw std::runtime_error("hot experts: ggml_init failed");
         p.ctxs.emplace_back(c);
-        return c;
+        buft_of[b] = buft;
+        return ctx_of[b] = c;
     };
-    for (const auto & t : todo) if (!dev_ctx.count(t.device)) dev_ctx[t.device] = new_ctx(todo.size() * 5);
-    ggml_context * host_ctx = new_ctx(todo.size());
+    auto new_map = [&](int b, ggml_backend_buffer_type_t buft, std::vector<int32_t> values, const char * what, int il, const char * tag) {
+        ggml_tensor * m = ggml_new_tensor_2d(new_ctx(b, buft), GGML_TYPE_I32, 1, n_exp);
+        ggml_format_name(m, "%s.map-%s-%d", what, tag, il);
+        map_fills.push_back({ m, std::move(values) });
+        return m;
+    };
 
-    struct fill { ggml_tensor * bank; const ggml_tensor * src; const std::vector<int> * experts; };
-    std::vector<fill> fills;
-    size_t n_hot = 0;
-    for (const auto & t : todo) {
-        ggml_context * c = dev_ctx[t.device];
-        const int K = (int) t.experts.size();
-        for (const ggml_tensor * s : t.src) {
-            ggml_tensor * b = ggml_new_tensor_3d(c, s->type, s->ne[0], s->ne[1], K);
-            if (b->nb[2] != s->nb[2]) throw std::runtime_error("hot experts: bank layout differs from the source tensor");
-            ggml_format_name(b, "hot.%s", s->name);
-            p.banks[s] = b;
-            fills.push_back({ b, s, &t.experts });
+    size_t n_hot = 0, n_split = 0, n_bank_layers = 0;
+    for (size_t il = 0; il < model.layers.size(); ++il) {
+        const llama_layer & l = model.layers[il];
+        const bool is_split = !l.ffn_exps_parts.empty();
+        auto hit = hot.find((int) il);
+        std::vector<int> want;
+        if (hit != hot.end()) {
+            want = hit->second;
+            std::sort(want.begin(), want.end());
+            want.erase(std::unique(want.begin(), want.end()), want.end());
         }
-        auto & lv = p.layers[t.il];
-        lv.view.hot_map = ggml_new_tensor_2d(c, GGML_TYPE_I32, 1, t.src[0]->ne[2]);
-        ggml_format_name(lv.view.hot_map, "hot.map-%d", t.il);
-        lv.view.cold_map = ggml_new_tensor_2d(host_ctx, GGML_TYPE_I32, 1, t.src[0]->ne[2]);
-        ggml_format_name(lv.view.cold_map, "hot.cold_map-%d", t.il);
-        lv.view.backend = backends[t.device];
-        lv.view.cpu = cpu;
-        lv.active = true;
-        n_hot += K;
+        if (!is_split && want.empty()) continue;
+        auto sources = layer_sources(l, n_exp);
+        if (sources.empty()) continue;
+
+        // GPU banks: each listed expert is copied from the source that holds it; one bank per source (one type each)
+        int device = -1;
+        if (!want.empty()) {
+            bool ok = true;
+            for (const auto & s : sources) {
+                for (const ggml_tensor * t : part_tensors(s.w)) {
+                    ok = ok && is_host_weight(t) && t->ne[3] == 1 && (size_t) t->nb[2] * (size_t) t->ne[2] == ggml_nbytes(t);
+                }
+            }
+            if (il < model.default_layer_device.size() && model.default_layer_device[il] >= 0) {
+                const auto * buft = model.default_buffer_type_offload(model.default_layer_device[il]);
+                for (size_t i = 0; i < bufts.size(); ++i) if (bufts[i] == buft && !ggml_backend_is_cpu(backends[i])) device = (int) i;
+            }
+            if (device < 0) {
+                for (size_t i = 0; i < backends.size() && device < 0; ++i) if (!ggml_backend_is_cpu(backends[i])) device = (int) i;
+            }
+            if (!ok) {
+                LLAMA_LOG_WARN("llama_hot_experts: layer %zu experts are not all host-resident and expert-contiguous; no GPU bank\n", il);
+                want.clear();
+            } else if (device < 0) {
+                throw std::runtime_error("hot experts: no GPU backend");
+            }
+            for (int e : want) {
+                for (auto & s : sources) if (s.local[e] >= 0) s.banked.push_back(e);
+            }
+        }
+
+        auto & L = p.layers[il];
+        for (const auto & s : sources) {
+            const int b = backend_of(s.w.down);
+            const auto buft = ggml_backend_is_cpu(backends[b]) ? ggml_backend_cpu_buffer_type() : ggml_backend_buffer_get_type(s.w.down->buffer);
+            if (is_split) {
+                part q = s.w;
+                q.backend = backends[b];
+                q.map = new_map(b, buft, s.local, "part", (int) il, s.w.tag);
+                L.large.push_back(q);
+            }
+            if (!want.empty()) {
+                std::vector<int32_t> v = s.local;
+                for (int e : s.banked) v[e] = -1;
+                part q = s.w;
+                q.backend = backends[b];
+                q.map = new_map(b, buft, std::move(v), "hot.rest", (int) il, s.w.tag);
+                L.small.push_back(q);
+            }
+        }
+        if (!want.empty()) {
+            for (const auto & s : sources) {
+                if (s.banked.empty()) continue;
+                ggml_context * c = new_ctx(device, bufts[device]);
+                const int K = (int) s.banked.size();
+                part q;
+                q.backend = backends[device];
+                q.bank = true;
+                q.tag = s.w.tag;
+                std::vector<int32_t> slices;
+                for (int e : s.banked) slices.push_back(s.local[e]);
+                for (ggml_tensor * const * pt : { &s.w.up, &s.w.gate, &s.w.up_gate, &s.w.down }) {
+                    const ggml_tensor * src = *pt;
+                    if (!src) continue;
+                    ggml_tensor * bank = ggml_new_tensor_3d(c, src->type, src->ne[0], src->ne[1], K);
+                    if (bank->nb[2] != src->nb[2]) throw std::runtime_error("hot experts: bank layout differs from the source tensor");
+                    ggml_format_name(bank, "hot.%s", src->name);
+                    bank_fills.push_back({ bank, src, slices });
+                    if (pt == &s.w.up) q.up = bank; else if (pt == &s.w.gate) q.gate = bank; else if (pt == &s.w.up_gate) q.up_gate = bank; else q.down = bank;
+                }
+                std::vector<int32_t> hm(n_exp, -1);
+                for (int k = 0; k < K; ++k) hm[s.banked[k]] = k;
+                q.map = new_map(device, bufts[device], std::move(hm), "hot", (int) il, s.w.tag);
+                L.small.push_back(q);
+                n_hot += K;
+            }
+            ++n_bank_layers;
+        }
+        if (L.small.empty()) L.small = L.large;
+        L.active = true;
+        n_split += is_split;
+    }
+    if (n_split == 0 && n_bank_layers == 0) {
+        LLAMA_LOG_WARN("llama_hot_experts: %s selects no eligible layer; hot experts inactive\n", path ? path : "(no file)");
+        return nullptr;
     }
 
     size_t dev_bytes = 0;
-    for (auto & [dev, c] : dev_ctx) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(c, bufts[dev]);
-        if (!buf) throw std::runtime_error("hot experts: GPU bank allocation failed (lower the budget)");
+    for (auto & [b, c] : ctx_of) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(c, buft_of[b]);
+        if (!buf) throw std::runtime_error(ggml_backend_is_cpu(backends[b]) ? "hot experts: host map allocation failed" :
+                "hot experts: GPU bank allocation failed (lower the budget)");
         ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        dev_bytes += ggml_backend_buffer_get_size(buf);
+        if (!ggml_backend_is_cpu(backends[b])) dev_bytes += ggml_backend_buffer_get_size(buf);
         p.bufs.emplace_back(buf);
     }
-    {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(host_ctx, ggml_backend_cpu_buffer_type());
-        if (!buf) throw std::runtime_error("hot experts: host map allocation failed");
-        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        p.bufs.emplace_back(buf);
-    }
-
-    for (const auto & f : fills) {
+    for (const auto & f : bank_fills) {
         const size_t nb2 = f.src->nb[2];
-        const auto & ex = *f.experts;
+        const auto & ex = f.slices;
         for (size_t i = 0; i < ex.size();) {
             size_t n = 1;
             while (i + n < ex.size() && ex[i + n] == ex[i] + (int) n) ++n;
@@ -508,33 +650,21 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
             i += n;
         }
     }
-    for (const auto & t : todo) {
-        const int n_exp = (int) t.src[0]->ne[2];
-        std::vector<int32_t> hm(n_exp, -1), cm(n_exp);
-        for (int e = 0; e < n_exp; ++e) cm[e] = e;
-        for (size_t s = 0; s < t.experts.size(); ++s) {
-            hm[t.experts[s]] = (int32_t) s;
-            cm[t.experts[s]] = -1;
-        }
-        auto & lv = p.layers[t.il].view;
-        ggml_backend_tensor_set(lv.hot_map, hm.data(), 0, hm.size() * sizeof(int32_t));
-        ggml_backend_tensor_set(lv.cold_map, cm.data(), 0, cm.size() * sizeof(int32_t));
-    }
+    for (const auto & f : map_fills) ggml_backend_tensor_set(f.map, f.values.data(), 0, f.values.size() * sizeof(int32_t));
 
-    LLAMA_LOG_INFO("llama_hot_experts: %s: %zu hot experts in %zu layers, %.2f MiB on GPU, two-path for batches <= %lld tokens\n",
-            path, n_hot, todo.size(), dev_bytes / 1048576.0, (long long) p.max_batch);
+    if (n_split) {
+        LLAMA_LOG_INFO("llama_hot_experts: %zu layers with split expert tensors (every batch runs one chain per partition)\n", n_split);
+    }
+    if (n_bank_layers) {
+        LLAMA_LOG_INFO("llama_hot_experts: %s: %zu hot experts in %zu layers, %.2f MiB on GPU, banks for batches <= %lld tokens\n",
+                path, n_hot, n_bank_layers, dev_bytes / 1048576.0, (long long) p.max_batch);
+    }
     return res;
 }
 
-bool llama_hot_experts::layer(int il, int64_t n_tokens, layer_view & out) const {
-    if (il < 0 || il >= (int) pimpl->layers.size() || !pimpl->layers[il].active) return false;
-    if (n_tokens <= 0 || n_tokens > pimpl->max_batch) return false;
-    out = pimpl->layers[il].view;
-    return true;
-}
-
-ggml_tensor * llama_hot_experts::bank(const ggml_tensor * w) const {
-    if (!w) return nullptr;
-    auto it = pimpl->banks.find(w);
-    return it == pimpl->banks.end() ? nullptr : it->second;
+const std::vector<llama_hot_experts::part> * llama_hot_experts::layer(int il, int64_t n_tokens) const {
+    if (il < 0 || il >= (int) pimpl->layers.size() || !pimpl->layers[il].active || n_tokens <= 0) return nullptr;
+    const auto & L = pimpl->layers[il];
+    const auto & v = n_tokens <= pimpl->max_batch ? L.small : L.large;
+    return v.empty() ? nullptr : &v;
 }

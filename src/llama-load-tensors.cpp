@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-expert-place.h"
 #include "ggml.h"
 
 
@@ -38,6 +39,7 @@ struct create_tensors_helper : public create_tensors_helper_interface {
     bool create_std_ffn_exps(int64_t n_embd, const LLM_TN & tn, int i, int flags = 0, int n_ff_exps_input = 0,
             ggml_context * ffn_ctx = nullptr);
     bool create_std_ffn_exps_from_meta(const LLM_TN & tn, int i, int flags = 0, ggml_context * ffn_ctx = nullptr);
+    bool create_split_ffn_exps(int i, int flags, ggml_context * ffn_ctx);
 
     bool create_tensors() override;
 
@@ -5162,6 +5164,7 @@ bool create_tensors_helper::create_std_ffn_exps(int64_t n_embd, const LLM_TN & t
     if (!ffn_ctx) {
         ffn_ctx = ctx_for_layer_split(i);
     }
+    if (create_split_ffn_exps(i, flags, ffn_ctx)) return false;
 
     bool merged = false;
     auto ug_name = tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i);
@@ -5181,11 +5184,76 @@ bool create_tensors_helper::create_std_ffn_exps(int64_t n_embd, const LLM_TN & t
     return merged;
 }
 
+// Routed experts split by expert into partitions (scripts/split_experts.py): blk.N.ffn_{up,gate,down}_exps_<tag>.weight
+// hold a subset of the experts each, blk.N.ffn_exps_part.weight (I32 [n_expert, 2]) gives every expert's partition tag
+// and its index inside that partition. Returns false if the layer is not split.
+bool create_tensors_helper::create_split_ffn_exps(int i, int flags, ggml_context * ffn_ctx) {
+    const std::string map_name = format("blk.%d.ffn_exps_part.weight", i);
+    const ggml_tensor * map_meta = ml.get_tensor_meta(map_name.c_str());
+    if (!map_meta) return false;
+    auto & layer = model.layers[i];
+    const int64_t n_expert = model.hparams.n_expert;
+    if (map_meta->type != GGML_TYPE_I32 || map_meta->ne[0] != n_expert || map_meta->ne[1] != 2) {
+        throw std::runtime_error(format("%s: expected I32 [%lld, 2]", map_name.c_str(), (long long) n_expert));
+    }
+    layer.ffn_exps_part = create_tensor(ffn_ctx, map_name, { n_expert, 2 }, flags);
+    // host copy straight from the file: tensor data is loaded only after all tensors exist, and the NUMA placement
+    // (before the load) and the context both need the map
+    layer.ffn_exps_part_map.resize(2*n_expert);
+    const auto & w = ml.require_weight(map_name.c_str());
+    ml.files.at(w.idx)->seek(w.offs, SEEK_SET);
+    ml.files.at(w.idx)->read_raw(layer.ffn_exps_part_map.data(), layer.ffn_exps_part_map.size()*sizeof(int32_t));
+
+    std::vector<int64_t> part_size(LLAMA_EXPERT_PART_MAX, -1);
+    for (int tag = 0; tag < LLAMA_EXPERT_PART_MAX; ++tag) {
+        auto make = [&](const char * role) -> ggml_tensor * {
+            const std::string name = format("blk.%d.ffn_%s_exps_%s.weight", i, role, llama_expert_part_tag(tag));
+            const ggml_tensor * m = ml.get_tensor_meta(name.c_str());
+            return m ? create_tensor(ffn_ctx, name, { m->ne[0], m->ne[1], m->ne[2] }, flags) : nullptr;
+        };
+        llama_layer::expert_part part;
+        part.tag     = tag;
+        part.up_gate = make("gate_up");
+        part.up      = make("up");
+        part.gate    = make("gate");
+        part.down    = make("down");
+        if (!part.up_gate && !part.up && !part.gate && !part.down) continue;
+        if (!part.down || !(part.up_gate || (part.up && part.gate))) {
+            throw std::runtime_error(format("blk.%d: expert partition '%s' lacks up/gate or down", i, llama_expert_part_tag(tag)));
+        }
+        part_size[tag] = part.down->ne[2];
+        for (const ggml_tensor * t : { part.up, part.gate, part.up_gate }) {
+            if (t && t->ne[2] != part_size[tag]) {
+                throw std::runtime_error(format("%s has %lld experts, the partition's down tensor %lld", t->name,
+                        (long long) t->ne[2], (long long) part_size[tag]));
+            }
+        }
+        layer.ffn_exps_parts.push_back(part);
+    }
+    // every expert lives in exactly one partition, at a distinct index
+    std::vector<std::vector<int>> seen(LLAMA_EXPERT_PART_MAX);
+    for (int tag = 0; tag < LLAMA_EXPERT_PART_MAX; ++tag) if (part_size[tag] > 0) seen[tag].assign(part_size[tag], 0);
+    for (int64_t e = 0; e < n_expert; ++e) {
+        const int32_t tag = layer.ffn_exps_part_map[e], idx = layer.ffn_exps_part_map[n_expert + e];
+        if (tag < 0 || tag >= LLAMA_EXPERT_PART_MAX || part_size[tag] <= 0 || idx < 0 || idx >= part_size[tag] || seen[tag][idx]++) {
+            throw std::runtime_error(format("%s: expert %lld maps to partition %d index %d, which is missing or used twice",
+                    map_name.c_str(), (long long) e, tag, idx));
+        }
+    }
+    for (int tag = 0; tag < LLAMA_EXPERT_PART_MAX; ++tag) {
+        for (int v : seen[tag]) if (!v) {
+            throw std::runtime_error(format("%s: partition '%s' holds an expert no map entry points to", map_name.c_str(), llama_expert_part_tag(tag)));
+        }
+    }
+    return true;
+}
+
 bool create_tensors_helper::create_std_ffn_exps_from_meta(const LLM_TN & tn, int i, int flags, ggml_context * ffn_ctx) {
     auto & layer = model.layers[i];
     if (!ffn_ctx) {
         ffn_ctx = ctx_for_layer_split(i);
     }
+    if (create_split_ffn_exps(i, flags, ffn_ctx)) return false;
 
     bool merged = false;
     auto ug_name = tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i);
