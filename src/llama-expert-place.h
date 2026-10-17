@@ -34,6 +34,9 @@ constexpr int LLAMA_EXPERT_PART_MAX = 8;
 const char * llama_expert_part_tag(int tag);
 
 void llama_expert_numa_apply(const llama_model & model, bool use_mmap);
+
+// whether a backend computes MUL_MAT_ID with weights of this type (a CPU backend always does)
+bool llama_backend_runs_expert_type(ggml_backend_t backend, ggml_type type);
 void llama_expert_numa_report(const llama_model & model);
 
 // MoE expert partitions of a context. A layer's routed experts are computed as a sum of partitions: each partition

@@ -361,6 +361,13 @@ void iqk_repack_tensor(struct ggml_tensor * tensor);
 bool iqk_modify_tensor(struct ggml_tensor * tensor);
 
 int iqk_repacked_type(const struct ggml_tensor * tensor); // int instead of ggml_type so we don't need to include ggml.h
+
+// Inverse of iqk_repack_tensor for MXFP4_R8, Q8_0_R8, Q2_K_R4, Q3_K_R4 and Q4_K_R4 (byte-exact).
+// iqk_unrepacked_type: the base type of an invertible repacked type, else the type itself.
+// iqk_unrepack: writes nrows rows of the base type to dst (no overlap with src); nrows must be a multiple of the
+// interleave (8 or 4). Returns false (and writes nothing) for any other type or shape.
+int  iqk_unrepacked_type(int type);
+bool iqk_unrepack(int type, int64_t nrows, int64_t n_per_row, const void * GGML_RESTRICT src, void * GGML_RESTRICT dst);
 bool iqk_should_modify_tensor(const struct ggml_tensor * tensor);
 
 // So we can re-pack Microsoft's BitNet I2_S quants

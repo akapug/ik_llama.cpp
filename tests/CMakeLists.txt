@@ -217,6 +217,10 @@ llama_build_and_test(test-regex-partial.cpp)
 llama_build_and_test(test-iq4-ks-kt-decode.cpp)
 target_include_directories(test-iq4-ks-kt-decode PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
+# byte-exact inverse of the run-time repack (-rtr) for the GPU hot-expert banks
+llama_build_and_test(test-iqk-unrepack.cpp)
+target_include_directories(test-iqk-unrepack PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
 # llama_target_and_test(test-opt.cpp) # SLOW
 
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")

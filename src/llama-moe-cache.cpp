@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-cache-share.h"
+#include "llama-expert-place.h"
 
 #include "ggml-cpp.h"
 
@@ -187,6 +188,7 @@ struct llama_moe_cache::impl {
         }
         if (devices.empty()) throw std::runtime_error("MoE cache requires a GPU backend");
 
+        size_t n_type_skips = 0;
         for (size_t il = 0; il < model.layers.size(); ++il) {
             auto experts = layer_experts(model.layers[il]);
             if (experts.empty() || !std::all_of(experts.begin(), experts.end(), is_host_weight)) continue;
@@ -199,6 +201,16 @@ struct llama_moe_cache::impl {
             const auto * layer_buft = model.default_buffer_type_offload(model_device);
             auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return d.buft == layer_buft; });
             if (it_dev == devices.end()) continue;
+            // the cache copies raw expert bytes: a type the device cannot run (e.g. a -rtr repacked CPU layout) stays uncached
+            const ggml_tensor * bad = nullptr;
+            for (const ggml_tensor * t : experts) if (!bad && !llama_backend_runs_expert_type(it_dev->backend, t->type)) bad = t;
+            if (bad) {
+                if (n_type_skips++ == 0) {
+                    LLAMA_LOG_WARN("%s: %s is %s, which %s cannot run; such layers are not cached\n", __func__, bad->name,
+                            ggml_type_name(bad->type), ggml_backend_name(it_dev->backend));
+                }
+                continue;
+            }
             const int32_t id = (int32_t) (it_dev - devices.begin());
             it_dev->model_device = model_device;
             auto it = std::find_if(groups.begin(), groups.end(), [&](const group & g) { return g.device == id && same_layout(g.ref, experts); });
@@ -214,6 +226,7 @@ struct llama_moe_cache::impl {
                 devices[id].host_bytes += ggml_nbytes(t);
             }
         }
+        if (n_type_skips) LLAMA_LOG_WARN("%s: %zu expert layers skipped for an unsupported weight type\n", __func__, n_type_skips);
         if (groups.empty()) {
             LLAMA_LOG_WARN("%s: no complete host-resident expert layer is eligible. MoE cache is inactive\n", __func__);
             return;
