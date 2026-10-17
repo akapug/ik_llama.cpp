@@ -4,6 +4,7 @@
 #include "llama-model.h"
 
 #include "ggml-cpp.h"
+#include "iqk/iqk_quantize.h"
 
 #include <algorithm>
 #include <climits>
@@ -434,6 +435,18 @@ std::vector<ggml_tensor *> part_tensors(const llama_hot_experts::part & p) {
 
 } // namespace
 
+bool llama_backend_runs_expert_type(ggml_backend_t backend, ggml_type type) {
+    if (ggml_backend_is_cpu(backend)) return true;
+    ggml_init_params ip = { 8 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx(ggml_init(ip));
+    if (!ctx) return false;
+    const int64_t ne0 = 8 * ggml_blck_size(type);
+    ggml_tensor * as  = ggml_new_tensor_3d(ctx.get(), type, ne0, 8, 2);
+    ggml_tensor * b   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, ne0, 1, 1);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 1);
+    return ggml_backend_supports_op(backend, ggml_mul_mat_id(ctx.get(), as, b, ids));
+}
+
 std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model & model,
         const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, bool allow_banks) {
     const bool split = std::any_of(model.layers.begin(), model.layers.end(), [](const llama_layer & l) { return !l.ffn_exps_parts.empty(); });
@@ -511,6 +524,21 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
     };
 
     struct bank_fill { ggml_tensor * bank; const ggml_tensor * src; std::vector<int32_t> slices; };
+
+    // bank type of a source tensor on a device: its own type when the device runs it, else the base type of a
+    // run-time repacked type (-rtr repacks host tensors to CPU-only interleaved layouts; the fill un-repacks),
+    // else GGML_TYPE_COUNT (no bank)
+    std::map<std::pair<int, int>, bool> runs_cache;
+    auto runs = [&](int device, ggml_type type) {
+        auto it = runs_cache.find({ device, (int) type });
+        if (it != runs_cache.end()) return it->second;
+        return runs_cache[{ device, (int) type }] = llama_backend_runs_expert_type(backends[device], type);
+    };
+    auto bank_type = [&](int device, const ggml_tensor * src) {
+        if (runs(device, src->type)) return src->type;
+        const auto base = (ggml_type) iqk_unrepacked_type(src->type);
+        return base != src->type && runs(device, base) ? base : GGML_TYPE_COUNT;
+    };
     struct map_fill  { ggml_tensor * map; std::vector<int32_t> values; };
     std::vector<bank_fill> bank_fills;
     std::vector<map_fill> map_fills;
@@ -569,6 +597,15 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
                 want.clear();
             } else if (device < 0) {
                 throw std::runtime_error("hot experts: no GPU backend");
+            } else {
+                for (const auto & s : sources) {
+                    for (const ggml_tensor * t : part_tensors(s.w)) {
+                        if (want.empty() || bank_type(device, t) != GGML_TYPE_COUNT) continue;
+                        LLAMA_LOG_WARN("llama_hot_experts: layer %zu: %s is %s, which %s cannot run; no GPU bank\n",
+                                il, t->name, ggml_type_name(t->type), ggml_backend_name(backends[device]));
+                        want.clear();
+                    }
+                }
             }
             for (int e : want) {
                 for (auto & s : sources) if (s.local[e] >= 0) s.banked.push_back(e);
@@ -608,7 +645,8 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
                 for (ggml_tensor * const * pt : { &s.w.up, &s.w.gate, &s.w.up_gate, &s.w.down }) {
                     const ggml_tensor * src = *pt;
                     if (!src) continue;
-                    ggml_tensor * bank = ggml_new_tensor_3d(c, src->type, src->ne[0], src->ne[1], K);
+                    // a repacked source keeps the base row size, so an un-repacked bank has the same expert stride
+                    ggml_tensor * bank = ggml_new_tensor_3d(c, bank_type(device, src), src->ne[0], src->ne[1], K);
                     if (bank->nb[2] != src->nb[2]) throw std::runtime_error("hot experts: bank layout differs from the source tensor");
                     ggml_format_name(bank, "hot.%s", src->name);
                     bank_fills.push_back({ bank, src, slices });
@@ -640,9 +678,22 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
         if (!ggml_backend_is_cpu(backends[b])) dev_bytes += ggml_backend_buffer_get_size(buf);
         p.bufs.emplace_back(buf);
     }
+    size_t n_unrepacked = 0;
+    std::vector<uint8_t> staging;
     for (const auto & f : bank_fills) {
         const size_t nb2 = f.src->nb[2];
         const auto & ex = f.slices;
+        if (f.bank->type != f.src->type) {
+            staging.resize(nb2);
+            for (size_t i = 0; i < ex.size(); ++i) {
+                if (!iqk_unrepack(f.src->type, f.src->ne[1], f.src->ne[0], (const char *) f.src->data + (size_t) ex[i] * nb2, staging.data())) {
+                    throw std::runtime_error(std::string("hot experts: cannot un-repack ") + f.src->name);
+                }
+                ggml_backend_tensor_set(f.bank, staging.data(), i * nb2, nb2);
+            }
+            n_unrepacked += ex.size();
+            continue;
+        }
         for (size_t i = 0; i < ex.size();) {
             size_t n = 1;
             while (i + n < ex.size() && ex[i + n] == ex[i] + (int) n) ++n;
@@ -658,6 +709,9 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
     if (n_bank_layers) {
         LLAMA_LOG_INFO("llama_hot_experts: %s: %zu hot experts in %zu layers, %.2f MiB on GPU, banks for batches <= %lld tokens\n",
                 path, n_hot, n_bank_layers, dev_bytes / 1048576.0, (long long) p.max_batch);
+        if (n_unrepacked) {
+            LLAMA_LOG_INFO("llama_hot_experts: %zu expert tensor slices un-repacked from run-time repacked (-rtr) host tensors\n", n_unrepacked);
+        }
     }
     return res;
 }

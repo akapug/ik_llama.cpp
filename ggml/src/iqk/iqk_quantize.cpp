@@ -9371,6 +9371,204 @@ void iqk_repack_tensor(struct ggml_tensor * tensor) {
     tensor->type = r.new_type;
 }
 
+//
+// Inverse of the repacks above (the offline form, online = false, which is what iqk_repack_tensor writes):
+// rebuilds the exact bytes of the base type. Used to copy experts that -rtr repacked into a backend
+// that has no kernels for the repacked type (GPU hot-expert banks).
+//
+namespace {
+
+void unrepack_mxfp4(int64_t nrows, int64_t n_per_row, const block_mxfp4_r8 * x, block_mxfp4 * y) {
+    const int64_t nblock = n_per_row/QK_MXFP4;
+    for (int64_t row = 0; row < nrows; row += 8) {
+        for (int64_t ib = 0; ib < nblock; ++ib) {
+            for (int k = 0; k < 8; ++k) {
+                auto & b = y[k*nblock + ib];
+                b.e = x[ib].e[k];
+                for (int l = 0; l < 4; ++l) for (int i = 0; i < 4; ++i) b.qs[4*l + i] = x[ib].qs[32*l + 4*k + i];
+            }
+        }
+        x += nblock;
+        y += 8*nblock;
+    }
+}
+
+void unrepack_q8_0(int64_t nrows, int64_t n_per_row, const block_q8_0_r8 * x, block_q8_0 * y) {
+    const int64_t nblock = n_per_row/QK8_0;
+    for (int64_t row = 0; row < nrows; row += 8) {
+        for (int64_t ib = 0; ib < nblock; ++ib) {
+            for (int k = 0; k < 8; ++k) {
+                auto & b = y[k*nblock + ib];
+                b.d = x[ib].d[k];
+                for (int l = 0; l < 4; ++l) for (int i = 0; i < 4; ++i) {
+                    b.qs[i + 4*l +  0] = x[ib].qs[32*l + 4*k + i +   0];
+                    b.qs[i + 4*l + 16] = x[ib].qs[32*l + 4*k + i + 128];
+                }
+            }
+        }
+        x += nblock;
+        y += 8*nblock;
+    }
+}
+
+// 2-bit fields of the _R4 k-quants: byte j of the 4-row interleave holds values i, i+4, i+8, i+12 of a 16-group
+void unpack_r4_2bit(const uint8_t * qs, int k, uint8_t * L) {
+    for (int ib = 0; ib < QK_K/32; ++ib) {
+        for (int i = 0; i < 4; ++i) {
+            const uint8_t q0 = qs[32*ib + 4*k + i], q1 = qs[32*ib + 4*k + i + 16];
+            for (int j = 0; j < 4; ++j) {
+                L[32*ib + i + 4*j +  0] = (q0 >> 2*j) & 3;
+                L[32*ib + i + 4*j + 16] = (q1 >> 2*j) & 3;
+            }
+        }
+    }
+}
+
+void unrepack_q2_k(int64_t nrows, int64_t n_per_row, const block_q2_k_r4 * x, block_q2_K * y) {
+    const int64_t nblock = n_per_row/QK_K;
+    uint8_t L[QK_K];
+    for (int64_t row = 0; row < nrows; row += 4) {
+        for (int64_t ibl = 0; ibl < nblock; ++ibl) {
+            for (int k = 0; k < 4; ++k) {
+                auto & b = y[k*nblock + ibl];
+                b.d    = x[ibl].d[k+0];
+                b.dmin = x[ibl].d[k+4];
+                for (int ib = 0; ib < QK_K/16; ++ib) b.scales[ib] = x[ibl].scales[4*ib + k];
+                unpack_r4_2bit(x[ibl].qs, k, L);
+                for (int n = 0; n < QK_K; n += 128) {
+                    for (int j = 0; j < 32; ++j) {
+                        b.qs[n/4 + j] = L[n + j] | (L[n + j + 32] << 2) | (L[n + j + 64] << 4) | (L[n + j + 96] << 6);
+                    }
+                }
+            }
+        }
+        x += nblock;
+        y += 4*nblock;
+    }
+}
+
+void unrepack_q3_k(int64_t nrows, int64_t n_per_row, const block_q3_k_r4 * x, block_q3_K * y) {
+    const int64_t nblock = n_per_row/QK_K;
+    uint8_t L[QK_K], Ld[QK_K/16];
+    for (int64_t row = 0; row < nrows; row += 4) {
+        for (int64_t ibl = 0; ibl < nblock; ++ibl) {
+            for (int k = 0; k < 4; ++k) {
+                auto & b = y[k*nblock + ibl];
+                b.d = x[ibl].d[k];
+                for (int ib = 0; ib < QK_K/32; ++ib) {
+                    for (int h = 0; h < 2; ++h) {
+                        const int is = 8*ib + k + 4*h;
+                        Ld[2*ib + h] = ((x[ibl].scales_l[is%32] >> 4*(is/32)) & 0xf) | (((x[ibl].scales_h[is%16] >> 2*(is/16)) & 3) << 4);
+                    }
+                }
+                unpack_r4_2bit(x[ibl].qs, k, L);
+                for (int ib = 0; ib < QK_K/32; ++ib) {
+                    for (int i = 0; i < 4; ++i) {
+                        const uint8_t qh = x[ibl].qh[16*ib + 4*k + i];
+                        for (int j = 0; j < 8; ++j) L[32*ib + i + 4*j] |= ((qh >> j) & 1) << 2;
+                    }
+                }
+                // scales: inverse of the unpacking in convert_q3_k (16 6-bit values in 12 bytes)
+                std::memset(b.scales, 0, sizeof(b.scales));
+                for (int j = 0; j < QK_K/16; ++j) {
+                    if (j < 8) b.scales[j] = Ld[j] & 0xf;
+                    else       b.scales[j-8] |= (Ld[j] & 0xf) << 4;
+                    b.scales[j%4 + 8] |= (Ld[j] >> 4) << 2*(j/4);
+                }
+                std::memset(b.qs, 0, sizeof(b.qs));
+                std::memset(b.hmask, 0, sizeof(b.hmask));
+                for (int n = 0; n < QK_K; n += 128) {
+                    for (int j = 0; j < 4; ++j) {
+                        for (int l = 0; l < 32; ++l) {
+                            const uint8_t v = L[n + 32*j + l];
+                            b.qs[n/4 + l] |= (v & 3) << 2*j;
+                            b.hmask[l]    |= (v >> 2) << (4*(n/128) + j);
+                        }
+                    }
+                }
+            }
+        }
+        x += nblock;
+        y += 4*nblock;
+    }
+}
+
+void unrepack_q4_k(int64_t nrows, int64_t n_per_row, const block_q4_k_r4 * x, block_q4_K * y) {
+    const int64_t nblock = n_per_row/QK_K;
+    uint8_t L[QK_K], Ld[QK_K/32], Lm[QK_K/32];
+    for (int64_t row = 0; row < nrows; row += 4) {
+        for (int64_t ibl = 0; ibl < nblock; ++ibl) {
+            for (int k = 0; k < 4; ++k) {
+                auto & b = y[k*nblock + ibl];
+                b.d    = x[ibl].d[k+0];
+                b.dmin = x[ibl].d[k+4];
+                for (int ib = 0; ib < QK_K/32; ++ib) {
+                    const int is = 4*ib + k;
+                    const uint8_t l = x[ibl].scales_l[is];
+                    const uint8_t h = (x[ibl].scales_h[is%16] >> 4*(is/16)) & 0xf;
+                    Ld[ib] = (l & 0xf) | ((h & 3) << 4);
+                    Lm[ib] = (l >>  4) | ((h >> 2) << 4);
+                    for (int i = 0; i < 4; ++i) {
+                        const uint8_t * q = x[ibl].qs + 64*ib + 4*k + i;
+                        L[32*ib + i +  0] = q[ 0] & 0xf; L[32*ib + i +  8] = q[ 0] >> 4;
+                        L[32*ib + i + 16] = q[16] & 0xf; L[32*ib + i + 24] = q[16] >> 4;
+                        L[32*ib + i +  4] = q[32] & 0xf; L[32*ib + i + 12] = q[32] >> 4;
+                        L[32*ib + i + 20] = q[48] & 0xf; L[32*ib + i + 28] = q[48] >> 4;
+                    }
+                }
+                // scales: the q4_K packing that get_scale_min_k4 reads
+                for (int j = 0; j < QK_K/32; ++j) {
+                    if (j < 4) {
+                        b.scales[j]   = Ld[j];
+                        b.scales[j+4] = Lm[j];
+                    } else {
+                        b.scales[j+4] = (Ld[j] & 0xf) | ((Lm[j] & 0xf) << 4);
+                        b.scales[j-4] |= (Ld[j] >> 4) << 6;
+                        b.scales[j-0] |= (Lm[j] >> 4) << 6;
+                    }
+                }
+                for (int ib64 = 0; ib64 < QK_K/64; ++ib64) {
+                    for (int j = 0; j < 32; ++j) b.qs[32*ib64 + j] = L[64*ib64 + j] | (L[64*ib64 + j + 32] << 4);
+                }
+            }
+        }
+        x += nblock;
+        y += 4*nblock;
+    }
+}
+
+struct Unrepack {
+    ggml_type base;
+    int       num_rows;
+    void (*func)(int64_t, int64_t, const void *, void *);
+};
+
+const Unrepack * get_unrepack_info(int type) {
+    static const std::unordered_map<int, Unrepack> k_map = {
+        { GGML_TYPE_MXFP4_R8, { GGML_TYPE_MXFP4, 8, [](int64_t n, int64_t m, const void * x, void * y) { unrepack_mxfp4(n, m, (const block_mxfp4_r8 *)x, (block_mxfp4 *)y); } } },
+        { GGML_TYPE_Q8_0_R8,  { GGML_TYPE_Q8_0,  8, [](int64_t n, int64_t m, const void * x, void * y) { unrepack_q8_0 (n, m, (const block_q8_0_r8  *)x, (block_q8_0  *)y); } } },
+        { GGML_TYPE_Q2_K_R4,  { GGML_TYPE_Q2_K,  4, [](int64_t n, int64_t m, const void * x, void * y) { unrepack_q2_k (n, m, (const block_q2_k_r4  *)x, (block_q2_K  *)y); } } },
+        { GGML_TYPE_Q3_K_R4,  { GGML_TYPE_Q3_K,  4, [](int64_t n, int64_t m, const void * x, void * y) { unrepack_q3_k (n, m, (const block_q3_k_r4  *)x, (block_q3_K  *)y); } } },
+        { GGML_TYPE_Q4_K_R4,  { GGML_TYPE_Q4_K,  4, [](int64_t n, int64_t m, const void * x, void * y) { unrepack_q4_k (n, m, (const block_q4_k_r4  *)x, (block_q4_K  *)y); } } },
+    };
+    auto it = k_map.find(type);
+    return it != k_map.end() ? &it->second : nullptr;
+}
+
+}
+
+int iqk_unrepacked_type(int type) {
+    auto u = get_unrepack_info(type);
+    return u ? (int)u->base : type;
+}
+
+bool iqk_unrepack(int type, int64_t nrows, int64_t n_per_row, const void * src, void * dst) {
+    auto u = get_unrepack_info(type);
+    if (!u || nrows % u->num_rows || n_per_row % ggml_blck_size(u->base)) return false;
+    u->func(nrows, n_per_row, src, dst);
+    return true;
+}
+
 void dequantize_row_ms_i2s(const void * vx, float * y, int64_t k) {
     constexpr int kBlockSize = 128;
     constexpr int kGroupSize = kBlockSize/4;
