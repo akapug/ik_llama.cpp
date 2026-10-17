@@ -52,6 +52,13 @@ static inline llama_dflash_kv_cache_transition llama_plan_dflash_kv_cache_transi
         if (!plan.rebuild_cache && bounded_keep_rows != expected_keep_rows) {
                 plan.rebuild_cache = true;
         }
+        // A stage ahead of DFlash in the chain (self-spec) drafted the rounds in
+        // between: each commit recorded a window update but only the newest
+        // append is still staged, so an incremental append would skip rows.
+        if (!plan.rebuild_cache && !plan.cache_up_to_date && cache_valid &&
+                        target_window_version != applied_window_version + 1) {
+                plan.rebuild_cache = true;
+        }
 
         plan.append_rows = bounded_append_rows;
         if (plan.cache_up_to_date) {
