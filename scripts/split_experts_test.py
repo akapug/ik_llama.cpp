@@ -109,6 +109,31 @@ def main():
             exp = ent[f'blk.0.ffn_{srcname}_exps.weight'].reshape(N_EXP, ne)[ids].reshape(-1)
             check(v is not None and np.array_equal(v, exp), f'imatrix blk.0.{role}_{TAGS[p]} = source rows {ids}')
 
+    # quantize rules: hot keeps the source type, cold gets q2_K with q3_K down on layers 0-1, warm iq3_k up only
+    rc, log = run(HERE / 'split_experts.py', src, '--dry-run', '--part', f'hot={d}/hot.tsv', '--part', f'warm={d}/warm.json',
+                  '--type', 'hot=keep', '--type', 'cold.down@0-1=Q3_K', '--type', 'cold=q2_k', '--type', 'warm.up=IQ3_K',
+                  '--quant-rules', d / 'rules.txt')
+    print(log.strip())
+    check(rc == 0, 'rules written')
+    import re
+    rules = [(re.compile(x.rpartition('=')[0]), x.rpartition('=')[2]) for x in (d / 'rules.txt').read_text().strip().split(',')]
+    first = lambda n: next((ty for rx, ty in rules if rx.search(n)), None)
+    for il in range(3):
+        src_t = 'f16' if il == 2 else 'f32'
+        for role in ('up', 'gate', 'down'):
+            for tag in TAGS:
+                n = f'blk.{il}.ffn_{role}_exps_{tag}.weight'
+                if n not in t:
+                    continue
+                want = {'hot': src_t, 'warm': 'iq3_k' if role == 'up' else src_t,
+                        'cold': 'q3_K' if role == 'down' and il <= 1 else 'q2_K'}[tag]
+                check(first(n) == want, f'rule for {n} -> {first(n)} (want {want}, ggml spelling)')
+    check(first('token_embd.weight') == 'f32', 'non-expert 2D tensor pinned to its source type')
+    check(first('blk.0.ffn_norm.weight') is None, '1D tensors get no rule (quantize leaves them)')
+    check(first('blk.0.ffn_up_exps.weight') is None, 'unsplit names match no partition rule')
+    rc, log = run(HERE / 'split_experts.py', src, '--dry-run', '--type', 'cold=q9_X')
+    check(rc != 0 and 'unknown ggml type' in log, 'unknown type refused')
+
     print('RESULT', 'PASS' if not fails else f'FAIL ({len(fails)})')
     sys.exit(1 if fails else 0)
 

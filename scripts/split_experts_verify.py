@@ -10,7 +10,9 @@ For every MoE layer of SPLIT:
     slice of the same global expert (a requantized partition is reported with its type and skipped).
 Every non-expert tensor must exist in both files with the same shape (and, with --bytes, the same type and bytes).
 Exit 0 only if everything holds. Multi-shard inputs: pass the first shard of each.
-usage: split_experts_verify.py ORIG.gguf SPLIT.gguf [--bytes] [--expect-types hot=MXFP4,cold=IQ2_KS]
+--expect-rules FILE: the llama-quantize --custom-q string split_experts.py wrote; every tensor a rule matches must have
+that rule's type (first match wins, as in quantize), and every tensor no rule matches must keep its source type.
+usage: split_experts_verify.py ORIG.gguf SPLIT.gguf [--bytes] [--expect-types hot=MXFP4,cold=IQ2_KS] [--expect-rules F]
 """
 import argparse, re, sys
 from pathlib import Path
@@ -43,6 +45,7 @@ def main():
     ap.add_argument('split')
     ap.add_argument('--bytes', action='store_true')
     ap.add_argument('--expect-types', default='')
+    ap.add_argument('--expect-rules')
     a = ap.parse_args()
     expect = {}
     for kv in filter(None, a.expect_types.split(',')):
@@ -135,12 +138,31 @@ def main():
             errs.append(f'{name}: shape {list(u.shape)} vs {list(t.shape)}')
         elif a.bytes and (u.tensor_type != t.tensor_type or not np.array_equal(np.asarray(u.data), np.asarray(t.data))):
             errs.append(f'{name}: type/bytes differ ({t.tensor_type.name} -> {u.tensor_type.name})')
+    if a.expect_rules:
+        rules = []
+        for item in Path(a.expect_rules).read_text().strip().split(','):
+            rx, _, typ = item.rpartition('=')
+            rules.append((re.compile(rx), typ.lower()))
+        n_ruled = 0
+        for name, u in dst.items():
+            want = next((typ for rx, typ in rules if rx.search(name)), None)
+            if want is None:
+                s = src.get(name)
+                if s is not None and u.tensor_type != s.tensor_type:
+                    errs.append(f'{name}: no rule, but the type changed {s.tensor_type.name} -> {u.tensor_type.name}')
+                continue
+            n_ruled += 1
+            if u.tensor_type.name.lower() != want:
+                errs.append(f'{name}: type {u.tensor_type.name}, the rules say {want}')
+        stats['tensors checked against the rules'] = n_ruled
     extra = [n for n in dst if n not in src and not PART_RE.match(n) and not MAP_RE.match(n)]
     if extra:
         errs.append(f'split file has unexpected tensors: {extra[:8]}')
 
     print(f'layers split: {len(maps)}; experts per partition: ' +
-          ', '.join(f'{k}={v}' for k, v in stats.items() if not k.startswith('requant')))
+          ', '.join(f'{k}={v}' for k, v in stats.items() if not k.startswith('requant') and ' ' not in k))
+    if 'tensors checked against the rules' in stats:
+        print(f"tensors whose type a rule sets: {stats['tensors checked against the rules']}")
     for k in sorted(k for k in stats if k.startswith('requant')):
         print(' ', k)
     for e in errs[:40]:
