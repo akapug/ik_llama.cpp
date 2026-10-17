@@ -248,16 +248,6 @@ void llama_expert_numa_apply(const llama_model & model, bool use_mmap) {
             int run_pol = p0 < p1 ? page_policy(p0) : -1;
             auto flush = [&](uintptr_t stop) {
                 if (run_pol < 0 || stop <= run) return;
-                const numa_policy & np = plan.policies[run_pol];
-                unsigned long mask[k_max_nodes / (8 * sizeof(unsigned long))] = {};
-                for (int n : np.nodes) mask[n / (8 * sizeof(unsigned long))] |= 1ul << (n % (8 * sizeof(unsigned long)));
-                const unsigned flags = MPOL_MF_MOVE | (strict ? MPOL_MF_STRICT : 0);
-                if (sys_mbind((void *) run, stop - run, np.mode, mask, maxnode, flags) != 0) {
-                    if (!plan.first_errno) plan.first_errno = errno;
-                    plan.failed += stop - run;
-                    return;
-                }
-                plan.intended[run_pol] += stop - run;
                 plan.ranges.push_back({ (char *) run, (size_t) (stop - run), run_pol });
             };
             for (uintptr_t p = p0 + page; p < p1; p += page) {
@@ -271,6 +261,30 @@ void llama_expert_numa_apply(const llama_model & model, bool use_mmap) {
             flush(p1);
         }
     }
+
+    // bind (and migrate, for pages already faulted in) the policy with the highest node first: on this platform the
+    // CPU-less PMem node has the highest number, so cold pages leave DRAM before hot pages need room in it
+    std::vector<size_t> order(plan.policies.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return plan.policies[a].min_node() > plan.policies[b].min_node(); });
+    std::vector<numa_range> placed;
+    for (size_t pi : order) {
+        const numa_policy & np = plan.policies[pi];
+        unsigned long mask[k_max_nodes / (8 * sizeof(unsigned long))] = {};
+        for (int n : np.nodes) mask[n / (8 * sizeof(unsigned long))] |= 1ul << (n % (8 * sizeof(unsigned long)));
+        const unsigned flags = MPOL_MF_MOVE | (strict ? MPOL_MF_STRICT : 0);
+        for (const auto & r : plan.ranges) {
+            if (r.policy != (int) pi) continue;
+            if (sys_mbind(r.addr, r.len, np.mode, mask, maxnode, flags) != 0) {
+                if (!plan.first_errno) plan.first_errno = errno;
+                plan.failed += r.len;
+                continue;
+            }
+            plan.intended[pi] += r.len;
+            placed.push_back(r);
+        }
+    }
+    plan.ranges = std::move(placed);
 
     LLAMA_LOG_INFO("%s: %s: %zu expert tensors placed in %zu ranges (%zu skipped), %zu straddle pages, %.2f MiB left at tensor edges\n",
             __func__, path, n_tensors, plan.ranges.size(), n_skipped, plan.straddle_pages, plan.unplaced / 1048576.0);
