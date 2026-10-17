@@ -109,6 +109,33 @@ def main():
             exp = ent[f'blk.0.ffn_{srcname}_exps.weight'].reshape(N_EXP, ne)[ids].reshape(-1)
             check(v is not None and np.array_equal(v, exp), f'imatrix blk.0.{role}_{TAGS[p]} = source rows {ids}')
 
+    # never-routed experts: an all-zero or non-finite row gets the mean of the tensor's healthy rows
+    z = {k: v.copy() for k, v in ent.items()}
+    z['blk.0.ffn_up_exps.weight'][2 * NE0:3 * NE0] = 0
+    z['blk.0.ffn_down_exps.weight'][0] = np.nan
+    with open(d / 'z.imatrix', 'wb') as f:
+        f.write(struct.pack('<i', len(z)))
+        for k, v in z.items():
+            f.write(struct.pack('<i', len(k)) + k.encode() + struct.pack('<ii', 5, len(v)) + v.tobytes())
+    rc, log = run(HERE / 'split_experts.py', src, '--dry-run', '--part', f'hot={d}/hot.tsv', '--part', f'warm={d}/warm.json',
+                  '--imatrix', d / 'z.imatrix', '--imatrix-out', d / 'z-out.imatrix')
+    print(log.strip())
+    data = (d / 'z-out.imatrix').read_bytes()
+    pos, zg = 4, {}
+    for _ in range(struct.unpack_from('<i', data, 0)[0]):
+        (ln,) = struct.unpack_from('<i', data, pos); pos += 4
+        name = data[pos:pos + ln].decode(); pos += ln
+        _, nv = struct.unpack_from('<ii', data, pos); pos += 8
+        zg[name] = np.frombuffer(data, dtype=np.float32, count=nv, offset=pos); pos += 4 * nv
+    up = z['blk.0.ffn_up_exps.weight'].reshape(N_EXP, NE0)
+    dn = z['blk.0.ffn_down_exps.weight'].reshape(N_EXP, NE1)
+    cold0 = [e for e in range(N_EXP) if part0[e] == 2]  # experts 0, 2, 4
+    got_up = zg['blk.0.ffn_up_exps_cold.weight'].reshape(-1, NE0)
+    got_dn = zg['blk.0.ffn_down_exps_cold.weight'].reshape(-1, NE1)
+    check(np.allclose(got_up[cold0.index(2)], up[[e for e in range(N_EXP) if e != 2]].mean(0)), 'zero imatrix row -> mean of healthy rows')
+    check(np.allclose(got_dn[cold0.index(0)], dn[1:].mean(0)), 'non-finite imatrix row -> mean of healthy rows')
+    check(np.array_equal(got_up[cold0.index(4)], up[4]), 'healthy imatrix rows unchanged')
+
     # quantize rules: hot keeps the source type, cold gets q2_K with q3_K down on layers 0-1, warm iq3_k up only
     rc, log = run(HERE / 'split_experts.py', src, '--dry-run', '--part', f'hot={d}/hot.tsv', '--part', f'warm={d}/warm.json',
                   '--type', 'hot=keep', '--type', 'cold.down@0-1=Q3_K', '--type', 'cold=q2_k', '--type', 'warm.up=IQ3_K',
@@ -133,6 +160,33 @@ def main():
     check(first('blk.0.ffn_up_exps.weight') is None, 'unsplit names match no partition rule')
     rc, log = run(HERE / 'split_experts.py', src, '--dry-run', '--type', 'cold=q9_X')
     check(rc != 0 and 'unknown ggml type' in log, 'unknown type refused')
+
+    # sharded source: the last shards hold no expert tensors; one of them lives in another dir (--shard-search)
+    sh = d / 'sh'; other = d / 'other'; sh.mkdir(); other.mkdir()
+    w = gguf.GGUFWriter(sh / 'tiny.gguf', 'deepseek4', split_max_tensors=4)
+    w.add_uint32('deepseek4.expert_count', N_EXP)
+    w.add_tensor('token_embd.weight', rng.standard_normal((10, NE0), dtype=np.float32))
+    for il in range(3):
+        for role, shape in (('up', (N_EXP, NE1, NE0)), ('gate', (N_EXP, NE1, NE0)), ('down', (N_EXP, NE0, NE1))):
+            w.add_tensor(f'blk.{il}.ffn_{role}_exps.weight', full[(il, role)].astype(np.float32))
+        w.add_tensor(f'blk.{il}.ffn_norm.weight', rng.standard_normal(NE0, dtype=np.float32))
+    for k in range(4):
+        w.add_tensor(f'engram.{k}.weight', rng.standard_normal((8, NE0), dtype=np.float32))
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+    shards = sorted(sh.glob('tiny-*-of-*.gguf'))
+    n_sh = len(shards)
+    shards[-1].rename(other / shards[-1].name)
+    rc, log = run(HERE / 'split_experts.py', shards[0], d / 'out' / 'tiny-split.gguf', '--part', f'hot={d}/hot.tsv',
+                  '--shard-search', other)
+    print(log.strip())
+    check(rc == 0, f'sharded split into a new dir ({n_sh} shards, last one found through --shard-search)')
+    outs = sorted((d / 'out').glob('tiny-split-*-of-*.gguf'))
+    check(len(outs) == n_sh, f'{len(outs)} output shards == {n_sh}')
+    last = outs[-1]
+    check(last.is_symlink() or last.stat().st_nlink > 1, f'{last.name}: no expert tensors, linked not rewritten')
+    rc, log = run(HERE / 'split_experts_verify.py', shards[0], outs[0], '--bytes', '--sample', '2', '--shard-search', other)
+    print(log.strip())
+    check(rc == 0 and 'RESULT PASS' in log, 'sampled verify of the sharded split passes')
 
     print('RESULT', 'PASS' if not fails else f'FAIL ({len(fails)})')
     sys.exit(1 if fails else 0)

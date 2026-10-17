@@ -14,7 +14,7 @@ Exit 0 only if everything holds. Multi-shard inputs: pass the first shard of eac
 that rule's type (first match wins, as in quantize), and every tensor no rule matches must keep its source type.
 usage: split_experts_verify.py ORIG.gguf SPLIT.gguf [--bytes] [--expect-types hot=MXFP4,cold=IQ2_KS] [--expect-rules F]
 """
-import argparse, re, sys
+import argparse, os, re, sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'gguf-py'))
@@ -28,15 +28,29 @@ MAP_RE = re.compile(r'^blk\.(\d+)\.ffn_exps_part\.weight$')
 SHARD_RE = re.compile(r'^(.*)-(\d{5})-of-(\d{5})\.gguf$')
 
 
-def tensors(first):
+def tensors(first, search=()):
+    """name -> (tensor, real path of its file); shards missing next to the first one are looked up in search dirs"""
     m = SHARD_RE.match(str(first))
     paths = [Path(first)] if not m else \
         [Path(f'{m.group(1)}-{i:05d}-of-{m.group(3)}.gguf') for i in range(1, int(m.group(3)) + 1)]
+    paths = [p if p.exists() else next((Path(d) / p.name for d in search if (Path(d) / p.name).exists()), p) for p in paths]
     out = {}
     for p in paths:
+        rp = os.path.realpath(p)
         for t in gguf.GGUFReader(p).tensors:
-            out[t.name] = t
+            out[t.name] = (t, rp)
     return out
+
+
+def same_bytes(u, t, sample):
+    a, b = np.asarray(u.data).reshape(-1).view(np.uint8), np.asarray(t.data).reshape(-1).view(np.uint8)
+    if a.size != b.size:
+        return False
+    if sample and a.size > 64 << 20:  # big tensor, sampled: head, tail and 16 spread 1 MiB windows
+        w = 1 << 20
+        starts = np.linspace(0, a.size - w, 18).astype(np.int64)
+        return all(np.array_equal(a[x:x + w], b[x:x + w]) for x in starts)
+    return np.array_equal(a, b)
 
 
 def main():
@@ -46,13 +60,20 @@ def main():
     ap.add_argument('--bytes', action='store_true')
     ap.add_argument('--expect-types', default='')
     ap.add_argument('--expect-rules')
+    ap.add_argument('--sample', type=int, default=0, metavar='K',
+                    help='with --bytes: check K random experts per partition and role, sample big non-expert tensors, '
+                         'skip tensors whose file is the same file as the source (linked shards)')
+    ap.add_argument('--shard-search', action='append', default=[], metavar='DIR')
     a = ap.parse_args()
     expect = {}
     for kv in filter(None, a.expect_types.split(',')):
         tag, _, typ = kv.partition('=')
         expect[tag] = typ.upper()
 
-    src, dst = tensors(a.orig), tensors(a.split)
+    src_f, dst_f = tensors(a.orig, a.shard_search), tensors(a.split, a.shard_search)
+    src = {k: v[0] for k, v in src_f.items()}
+    dst = {k: v[0] for k, v in dst_f.items()}
+    rng = np.random.default_rng(1)
     errs = []
     full = {}
     for name, t in src.items():
@@ -123,7 +144,8 @@ def main():
                     continue
                 sb = np.asarray(s.data).reshape(n_exp, -1)
                 tb = np.asarray(t.data).reshape(int(t.shape[2]), -1)
-                for e in ids:
+                pick = rng.choice(ids, size=min(a.sample, len(ids)), replace=False) if a.sample else ids
+                for e in pick:
                     if not np.array_equal(sb[e], tb[idx_of[e]]):
                         errs.append(f'{where}.{tag}.{role}: expert {e} (slot {idx_of[e]}) differs from the source slice')
                         break
@@ -136,7 +158,9 @@ def main():
             errs.append(f'{name}: missing from the split file')
         elif list(u.shape) != list(t.shape):
             errs.append(f'{name}: shape {list(u.shape)} vs {list(t.shape)}')
-        elif a.bytes and (u.tensor_type != t.tensor_type or not np.array_equal(np.asarray(u.data), np.asarray(t.data))):
+        elif a.bytes and a.sample and src_f[name][1] == dst_f[name][1]:
+            stats['non-expert tensors in linked shards (same file)'] = stats.get('non-expert tensors in linked shards (same file)', 0) + 1
+        elif a.bytes and (u.tensor_type != t.tensor_type or not same_bytes(u, t, a.sample)):
             errs.append(f'{name}: type/bytes differ ({t.tensor_type.name} -> {u.tensor_type.name})')
     if a.expect_rules:
         rules = []
@@ -161,6 +185,9 @@ def main():
 
     print(f'layers split: {len(maps)}; experts per partition: ' +
           ', '.join(f'{k}={v}' for k, v in stats.items() if not k.startswith('requant') and ' ' not in k))
+    for k in ('non-expert tensors in linked shards (same file)',):
+        if k in stats:
+            print(f'{k}: {stats[k]}')
     if 'tensors checked against the rules' in stats:
         print(f"tensors whose type a rule sets: {stats['tensors checked against the rules']}")
     for k in sorted(k for k in stats if k.startswith('requant')):
