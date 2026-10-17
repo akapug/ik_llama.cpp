@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <climits>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -389,9 +390,17 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
         if (il < 0 || ids.empty()) {
             throw std::runtime_error(std::string(path) + ":" + std::to_string(ln) + ": expected 'blk.N<TAB>expert,list'");
         }
-        auto & v = hot[il];
         const int n_exp = (int) model.hparams.n_expert;
-        for (int e : parse_ids(ids, n_exp, std::string(path) + ":" + std::to_string(ln))) v.push_back(e);
+        const auto parsed = parse_ids(ids, INT_MAX, std::string(path) + ":" + std::to_string(ln));
+        if (!parsed.empty() && *std::max_element(parsed.begin(), parsed.end()) >= n_exp) {
+            // the file names an expert this model lacks: written for another model (a speculative draft with fewer
+            // experts reads the same env) -> no hot set for this model, as for a missing layer above
+            LLAMA_LOG_WARN("llama_hot_experts: %s:%d names expert %d but this model has %d experts; hot experts inactive for this model\n",
+                path, ln, *std::max_element(parsed.begin(), parsed.end()), n_exp);
+            return nullptr;
+        }
+        auto & v = hot[il];
+        v.insert(v.end(), parsed.begin(), parsed.end());
     }
 
     struct pending { int il; int device; std::vector<int> experts; std::vector<ggml_tensor *> src; };

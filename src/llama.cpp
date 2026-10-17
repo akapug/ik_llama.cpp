@@ -5345,7 +5345,9 @@ static bool llm_load_tensors(
     // load tensor data
     if (!dry_run) {
         // bind expert byte ranges to NUMA nodes before the data is read, so pages fault onto their target node
-        llama_expert_numa_apply(model, ml.use_mmap);
+        // under --no-mmap with deferred tables the loader keeps use_mmap for those tables only; the experts are copied
+        // into allocated buffers (defer_copy_dense), so placement applies
+        llama_expert_numa_apply(model, ml.use_mmap && !ml.defer_copy_dense);
         for (auto & it : ctx_bufs) {
             ggml_context * ctx = it.first;
             auto & bufs = it.second;
