@@ -633,6 +633,8 @@ struct llama_context {
             struct ggml_tensor * raw_k_write_src_idxs = nullptr;
             struct ggml_tensor * raw_k_write_idxs = nullptr;
             struct ggml_tensor * raw_k_read_idxs = nullptr;
+            // raw (SWA) mask in raw_k_read_idxs order: [read rows per stream, token rows per stream, 1, n_stream]
+            struct ggml_tensor * raw_kq_mask = nullptr;
             comp_inputs csa;
             comp_inputs hca;
             comp_inputs lid;

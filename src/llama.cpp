@@ -656,6 +656,11 @@ static inline uint64_t model_state_hash(const llama_context & lctx) {
     mix(lctx.dsv4.raw.write_src_idxs.size());
     mix(lctx.dsv4.raw.write_dst_idxs.size());
     mix(lctx.dsv4.raw.read_dst_idxs.size());
+    if (lctx.cparams.n_seq_max > 1) {
+        // with several slots the raw keys are gathered per sequence and the graph bakes the
+        // visible row count (raw.n_kv) into its mask views; it grows every token
+        mix(lctx.dsv4.raw.n_kv);
+    }
     // graphs of per-step checkpointed batches keep the per-token compressor state rows (llama_dsv4_spec_ckpt_capture_rows)
     // up to the checkpoint's row capacity
     mix(llama_dsv4_per_step_capture_active(lctx) ? 1 + (uint64_t) llama_dsv4_per_step_capacity(lctx) : 0);
@@ -11842,7 +11847,7 @@ struct llama_data_read {
         }
     }
 
-    bool read_kv_cache_meta(struct llama_context * ctx, uint32_t cell_count, llama_seq_id dest_seq_id = -1) {
+    bool read_kv_cache_meta(struct llama_context * ctx, uint32_t cell_count, llama_seq_id dest_seq_id = -1, bool partial = false) {
         struct llama_kv_cache & kv_self = ctx->kv_self;
 
         if (dest_seq_id != -1) {
@@ -11858,6 +11863,46 @@ struct llama_data_read {
                 return false;
             }
 
+            std::vector<llama_pos> cell_pos(cell_count);
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                uint32_t n_seq_id;
+
+                read_to(&cell_pos[i], sizeof(cell_pos[i]));
+                read_to(&n_seq_id, sizeof(n_seq_id));
+
+                if (n_seq_id != 0) {
+                    LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
+                    return false;
+                }
+            }
+
+            // A partial state carries no K/V rows. Re-placing its cells with find_slot would point them at
+            // other rows' keys whenever the free cells start elsewhere, which several sequences make
+            // likely. So with several sequences, when every saved position still has its cell, keep the
+            // cells (and their keys) in place and only drop the cells the state does not list.
+            if (partial && ctx->cparams.n_seq_max > 1 && cell_count > 0 && !kv_self.any_compacted()) {
+                std::unordered_set<llama_pos> saved(cell_pos.begin(), cell_pos.end());
+                std::vector<llama_pos> extra;
+                uint32_t found = 0;
+                for (uint32_t c = 0; c < kv_self.size; ++c) {
+                    const auto & cell = kv_self.cells[c];
+                    if (cell.is_empty() || !cell.has_seq_id(dest_seq_id)) {
+                        continue;
+                    }
+                    if (saved.count(cell.pos)) {
+                        ++found;
+                    } else {
+                        extra.push_back(cell.pos);
+                    }
+                }
+                if (found == saved.size() && saved.size() == cell_count) {
+                    for (llama_pos p : extra) {
+                        llama_kv_cache_seq_rm(kv_self, dest_seq_id, p, p + 1);
+                    }
+                    return true;
+                }
+            }
+
             llama_kv_cache_seq_rm(kv_self, dest_seq_id, -1, -1);
 
             if (cell_count == 0) {
@@ -11871,18 +11916,7 @@ struct llama_data_read {
             batch.n_tokens = cell_count;
             bool disordered = false;
             for (uint32_t i = 0; i < cell_count; ++i) {
-                llama_pos pos;
-                uint32_t n_seq_id;
-
-                read_to(&pos, sizeof(pos));
-                read_to(&n_seq_id, sizeof(n_seq_id));
-
-                if (n_seq_id != 0) {
-                    llama_batch_free(batch);
-                    LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
-                    return false;
-                }
-
+                const llama_pos pos = cell_pos[i];
                 if (i > 0 && pos < batch.pos[i - 1]) {
                     disordered = true;
                 }
@@ -12636,7 +12670,7 @@ struct llama_data_read {
         }
 
         // scalars before rows: they set the placement offset, and seq_rm inside meta resets head_swa
-        bool res = read_kv_cache_meta(ctx, cell_count, seq_id);
+        bool res = read_kv_cache_meta(ctx, cell_count, seq_id, (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0);
         if (res && compact_blob) {
             kv_self.pos_base_swa = restore_pos_base;
             kv_self.head_swa     = restore_head_swa;
