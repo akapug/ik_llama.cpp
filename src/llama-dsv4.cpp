@@ -13,7 +13,9 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <cstring>
 #include <map>
 #include <stdexcept>
@@ -276,9 +278,7 @@ static llama_context::dsv4_runtime::slot_info dsv4_build_comp_sinfo(
         sinfo.s1 = 0;
     }
 
-    if (n_stream > 1 && sinfo.s1 - sinfo.s0 + 1 != (int32_t) sinfo.n_stream()) {
-        LLAMA_LOG_ERROR("%s: DSV4 compressed streams are not contiguous in batch\n", __func__);
-    }
+    // streams need not be contiguous or ascending: dsv4_comp_get_k gathers them by strm[]
 
     return sinfo;
 }
@@ -434,6 +434,14 @@ static bool dsv4_build_raw_context(
             raw.read_dst_idxs.push_back((int32_t) row);
             ++count;
         }
+        if (!compacted && lctx.cparams.n_seq_max > 1) {
+            // With several sequences, freed cells are reused out of position order. The graph's
+            // sliding-window view takes the last gathered rows as the newest, so gather by position.
+            auto & idxs = raw.sinfo_read.idxs[s];
+            std::stable_sort(idxs.begin(), idxs.end(), [&kv](uint32_t x, uint32_t y) {
+                return kv.cells[x].pos < kv.cells[y].pos;
+            });
+        }
         raw.read_counts.push_back(count);
         raw.n_kv = std::max<int64_t>(raw.n_kv, count);
     }
@@ -485,8 +493,46 @@ static bool dsv4_build_raw_context(
     if (raw.n_kv > 0) {
         raw.read_dst_idxs.clear();
         const size_t read_rows = GGML_PAD((size_t) raw.n_kv, 256u);
-        for (size_t s = 0; s < raw.sinfo_read.n_stream(); ++s) {
+        const size_t n_read_stream = raw.sinfo_read.n_stream();
+        for (size_t s = 0; s < n_read_stream; ++s) {
             const auto & rows = raw.sinfo_read.idxs[s];
+            if (n_read_stream > 1 && !compacted) {
+                // A multi-sequence batch. Padding a shorter stream by repeating its last row would
+                // make that row visible n_kv - count extra times, and the sliding-window view (the
+                // last rows of each stream) would miss its recent rows. Instead front-fill with a
+                // cell of another stream, which the KQ mask hides from this stream's tokens, and put
+                // the stream's rows, in position order, at the end of the visible n_kv.
+                const llama_seq_id seq_id = read_seq_ids[s];
+                int32_t hidden = -1;
+                for (size_t o = 0; o < n_read_stream && hidden < 0; ++o) {
+                    for (uint32_t slot : raw.sinfo_read.idxs[o]) {
+                        if (!kv.cells[slot].has_seq_id(seq_id)) {
+                            hidden = (int32_t) slot;
+                            break;
+                        }
+                    }
+                }
+                if (hidden < 0 && !rows.empty()) {
+                    // every gathered cell is shared with this sequence: front-fill with copies of its
+                    // oldest row, which the raw mask hides (only the last copy of a run is visible)
+                    hidden = (int32_t) rows.front();
+                }
+                if (hidden >= 0 || rows.size() == (size_t) raw.n_kv) {
+                    for (size_t i = rows.size(); i < (size_t) raw.n_kv; ++i) {
+                        raw.read_dst_idxs.push_back(hidden);
+                    }
+                    // rows are in position order (sorted above)
+                    for (uint32_t slot : rows) {
+                        raw.read_dst_idxs.push_back((int32_t) slot);
+                    }
+                    // beyond n_kv the graph masks every column
+                    const int32_t tail = rows.empty() ? 0 : (int32_t) rows.back();
+                    for (size_t i = (size_t) raw.n_kv; i < read_rows; ++i) {
+                        raw.read_dst_idxs.push_back(tail);
+                    }
+                    continue;
+                }
+            }
             for (uint32_t slot : rows) {
                 raw.read_dst_idxs.push_back((int32_t) slot);
             }
@@ -868,6 +914,77 @@ static void dsv4_set_input_tensor(ggml_tensor * tensor, const std::vector<T> & v
         return;
     }
     ggml_backend_tensor_set(tensor, values.data(), 0, values.size()*sizeof(T));
+}
+
+// The raw (SWA) mask in raw_k_read_idxs order (build_deepseek4.cpp: dsv4_new_raw_kq_mask_input):
+// column j of stream s is gathered row read_dst_idxs[s*n_read + j]. A token sees a column under the
+// KQ_mask_swa rule for that row's cell. Columns from raw.n_kv on, and every copy of a row but the
+// last of a run (front-fill or repeat padding), stay hidden; token rows past the stream's tokens
+// (flash-attention padding) stay hidden.
+static void dsv4_set_raw_kq_mask(const llama_context & lctx, const llama_batch & batch) {
+    ggml_tensor * t = lctx.dsv4.inputs.raw_kq_mask;
+    if (t == nullptr || t->buffer == nullptr) {
+        return;
+    }
+    const auto & raw = lctx.dsv4.raw;
+    const auto & kv = lctx.kv_self;
+    const auto & hp = lctx.model.hparams;
+    const int64_t n_read = t->ne[0], n_rows = t->ne[1], n_stream = t->ne[3];
+    GGML_ASSERT(t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_F32);
+    GGML_ASSERT((int64_t) raw.read_dst_idxs.size() == n_read*n_stream && raw.n_kv <= n_read);
+    GGML_ASSERT(batch.n_tokens % n_stream == 0 && batch.n_tokens/n_stream <= n_rows && batch.pos != nullptr);
+    const int64_t n_tokens_stream = batch.n_tokens/n_stream;
+    constexpr llama_pos hidden = std::numeric_limits<llama_pos>::min();
+
+    std::vector<float> f((size_t) (n_read*n_rows*n_stream), -INFINITY);
+    std::vector<llama_pos> col_pos((size_t) n_read);
+    for (int64_t s = 0; s < n_stream; ++s) {
+        const int32_t * idx = raw.read_dst_idxs.data() + s*n_read;
+        llama_seq_id col_seq = -1;
+        for (int64_t r = 0; r < n_tokens_stream; ++r) {
+            const int64_t i = s*n_tokens_stream + r;
+            const llama_pos pos = batch.pos[i];
+            const llama_seq_id seq_id = batch.seq_id[i][0];
+            if (seq_id != col_seq) {
+                col_seq = seq_id;
+                std::fill(col_pos.begin(), col_pos.end(), hidden);
+                for (int64_t j = 0; j < raw.n_kv; ++j) {
+                    if (j + 1 < raw.n_kv && idx[j + 1] == idx[j]) {
+                        continue;
+                    }
+                    const llama_kv_cell & cell = kv.cells[(size_t) idx[j]];
+                    if (!cell.is_empty() && cell.pos >= 0 && cell.has_seq_id(seq_id)) {
+                        col_pos[(size_t) j] = cell.pos;
+                    }
+                }
+            }
+            float * row = f.data() + (s*n_rows + r)*n_read;
+            for (int64_t j = 0; j < raw.n_kv; ++j) {
+                const llama_pos p = col_pos[(size_t) j];
+                if (p == hidden || p > pos) {
+                    continue;
+                }
+                if (hp.n_attn_chunk) {
+                    const llama_pos chunk_start = (pos / hp.n_attn_chunk) * hp.n_attn_chunk;
+                    if (p < chunk_start) {
+                        continue;
+                    }
+                } else if (hp.n_swa > 0 && pos - p >= (llama_pos) hp.n_swa) {
+                    continue;
+                }
+                row[j] = hp.use_alibi ? -std::abs((float) (p - pos)) : 0.0f;
+            }
+        }
+    }
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_set(t, f.data(), 0, f.size()*sizeof(float));
+        return;
+    }
+    std::vector<ggml_fp16_t> h(f.size());
+    for (size_t k = 0; k < f.size(); ++k) {
+        h[k] = ggml_fp32_to_fp16(f[k]);
+    }
+    ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
 }
 
 static void dsv4_set_mask_tensor(
@@ -1946,6 +2063,7 @@ bool llama_prepare_dsv4_graph_inputs(llama_context & lctx, const llama_batch & b
             dsv4_set_input_tensor(lctx.dsv4.inputs.raw_k_write_src_idxs, lctx.dsv4.raw.write_src_idxs);
             dsv4_set_input_tensor(lctx.dsv4.inputs.raw_k_write_idxs, lctx.dsv4.raw.write_dst_idxs);
             dsv4_set_input_tensor(lctx.dsv4.inputs.raw_k_read_idxs, lctx.dsv4.raw.read_dst_idxs);
+            dsv4_set_raw_kq_mask(lctx, batch);
         }
         return true;
     }
@@ -2009,6 +2127,7 @@ bool llama_prepare_dsv4_graph_inputs(llama_context & lctx, const llama_batch & b
     dsv4_set_input_tensor(lctx.dsv4.inputs.raw_k_write_src_idxs, lctx.dsv4.raw.write_src_idxs);
     dsv4_set_input_tensor(lctx.dsv4.inputs.raw_k_write_idxs, lctx.dsv4.raw.write_dst_idxs);
     dsv4_set_input_tensor(lctx.dsv4.inputs.raw_k_read_idxs, lctx.dsv4.raw.read_dst_idxs);
+    dsv4_set_raw_kq_mask(lctx, batch);
 
     auto set_comp = [&](llama_context::dsv4_runtime::comp_inputs & inputs, llama_context::dsv4_runtime::comp_plan & plan, bool set_mask) {
         dsv4_set_input_tensor(inputs.state_pos, plan.state_pos);
