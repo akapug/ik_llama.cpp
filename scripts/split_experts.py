@@ -79,12 +79,21 @@ def load_list(path):
     return res
 
 
-def shard_paths(first):
+def shard_paths(first, search=()):
+    """all shards of a split GGUF; a shard missing next to the first one is looked up in the --shard-search dirs"""
     m = SHARD_RE.match(str(first))
     if not m:
         return [Path(first)], None
     n = int(m.group(3))
-    return [Path(f'{m.group(1)}-{i:05d}-of-{n:05d}.gguf') for i in range(1, n + 1)], n
+    out = []
+    for i in range(1, n + 1):
+        p = Path(f'{m.group(1)}-{i:05d}-of-{n:05d}.gguf')
+        if not p.exists():
+            p = next((Path(d) / p.name for d in search if (Path(d) / p.name).exists()), p)
+        if not p.exists():
+            raise SystemExit(f'shard {p.name} not found next to {first} nor in --shard-search {list(search)}')
+        out.append(p)
+    return out, n
 
 
 def out_paths(out, n):
@@ -212,7 +221,20 @@ def count_items(r, plan, maps):
     return n
 
 
-def slice_imatrix(src, dst, plan):
+def fix_zero_rows(name, rows):
+    """experts never routed while the imatrix was collected have all-zero (or non-finite) importance, and q2_K/q3_K
+    quantization with such weights fails validation: give them the mean of the tensor's healthy expert rows"""
+    bad = ~np.isfinite(rows).all(axis=1) | (rows == 0).all(axis=1)
+    if bad.any():
+        if bad.all():
+            print(f'warning: imatrix {name}: no healthy expert row, left as is', file=sys.stderr)
+            return rows, 0
+        rows = rows.copy()
+        rows[bad] = rows[~bad].mean(axis=0)
+    return rows, int(bad.sum())
+
+
+def slice_imatrix(src, dst, plan, fix_zeros=True):
     data = Path(src).read_bytes()
     pos = 0
 
@@ -236,7 +258,7 @@ def slice_imatrix(src, dst, plan):
         order.append(name)
     trailer = data[pos:]
     out = dict(entries)
-    made = 0
+    made = n_fixed = 0
     for il, (n_exp, part_of, idx_of, members) in plan.items():
         for role in ('up', 'gate', 'down', 'gate_up'):
             name = f'blk.{il}.ffn_{role}_exps.weight'
@@ -247,6 +269,9 @@ def slice_imatrix(src, dst, plan):
             if len(vals) % n_exp:
                 raise SystemExit(f'imatrix {src_name}: {len(vals)} values are not a multiple of {n_exp} experts')
             rows = vals.reshape(n_exp, -1)
+            if fix_zeros:
+                rows, nb = fix_zero_rows(src_name, rows)
+                n_fixed += nb if src_name == name else 0
             for p, ids in members.items():
                 out[f'blk.{il}.ffn_{role}_exps_{TAGS[p]}.weight'] = (ncall, np.ascontiguousarray(rows[ids]).reshape(-1))
                 made += 1
@@ -257,7 +282,8 @@ def slice_imatrix(src, dst, plan):
             fo.write(struct.pack('<i', len(b)) + b + struct.pack('<ii', ncall, len(vals)))
             fo.write(np.asarray(vals, dtype=np.float32).tobytes())
         fo.write(trailer)
-    print(f'imatrix: {len(entries)} entries in, {made} partition entries added -> {dst}')
+    print(f'imatrix: {len(entries)} entries in, {made} partition entries added -> {dst}' +
+          (f'; {n_fixed} all-zero/non-finite expert rows set to the tensor mean' if fix_zeros else ''))
 
 
 ROLES = ('up', 'gate', 'down', 'gate_up')
@@ -334,8 +360,11 @@ def main():
     ap.add_argument('--rest', default='cold', choices=TAGS)
     ap.add_argument('--imatrix')
     ap.add_argument('--imatrix-out')
+    ap.add_argument('--no-imatrix-fix', action='store_true', help='keep all-zero expert rows (quantize then fails on them)')
+    ap.add_argument('--shard-search', action='append', default=[], metavar='DIR', help='other dirs holding shards of the input')
     ap.add_argument('--no-link-unchanged', action='store_true')
     ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--skip-split', action='store_true', help='OUTPUT shards already written by an earlier run: only quantize')
     ap.add_argument('--type', action='append', default=[], metavar='TAG[.ROLE][@LAYERS]=TYPE')
     ap.add_argument('--quant-rules', metavar='FILE', help='write the llama-quantize --custom-q rule string here')
     ap.add_argument('--quantize-bin', metavar='DIR', help='run DIR/llama-quantize on the split output with the rules')
@@ -352,7 +381,7 @@ def main():
             raise SystemExit(f'--part {tag} is also the --rest partition')
         lists.append((tag, load_list(path)))
 
-    ins, n_split = shard_paths(a.input)
+    ins, n_split = shard_paths(a.input, a.shard_search)
     readers = [gguf.GGUFReader(p) for p in ins]
     plan = build_plan(readers, lists, a.rest)
     if not plan:
@@ -393,11 +422,12 @@ def main():
     if a.imatrix:
         if not a.imatrix_out:
             raise SystemExit('--imatrix needs --imatrix-out')
-        slice_imatrix(a.imatrix, a.imatrix_out, plan)
+        slice_imatrix(a.imatrix, a.imatrix_out, plan, not a.no_imatrix_fix)
     if a.dry_run or not a.output:
         return
 
     outs = out_paths(a.output, n_split)
+    outs[0].parent.mkdir(parents=True, exist_ok=True)
     # each layer's map tensor goes to the shard that holds the layer's first expert tensor
     maps = [set() for _ in readers]
     for il in plan:
@@ -405,9 +435,13 @@ def main():
         maps[first].add(il)
     n_total = sum(count_items(r, plan, m) for r, m in zip(readers, maps))
     for r, src, dst, mp in zip(readers, ins, outs, maps):
+        if a.skip_split:
+            if not dst.exists():
+                raise SystemExit(f'--skip-split: {dst} is missing')
+            continue
         has_exps = any(EXP_RE.match(t.name) for t in r.tensors)
         if n_split and not has_exps and not a.no_link_unchanged and src != ins[0]:
-            if dst.exists():
+            if dst.exists() or dst.is_symlink():
                 dst.unlink()
             try:
                 os.link(src, dst)
@@ -425,7 +459,23 @@ def main():
         if a.imatrix_out:
             cmd += ['--imatrix', a.imatrix_out]
         if n_split:
-            cmd += ['--keep-split']
+            # shards without expert tensors are not rewritten: link them at the output names; --partial-requant then
+            # skips every existing output shard (their tensors keep the source types, which the rules pin anyway)
+            cmd += ['--keep-split', '--partial-requant']
+            base = re.sub(r'(-\d{5}-of-\d{5})?\.gguf$', '', a.quant_out)
+            Path(base).parent.mkdir(parents=True, exist_ok=True)
+            for i, src in enumerate(ins):
+                q = Path(f'{base}-{i + 1:05d}-of-{n_split:05d}.gguf')
+                if q.exists() or q.is_symlink():
+                    q.unlink()  # a shard left by an earlier run would be skipped
+                if any(EXP_RE.match(t.name) for t in readers[i].tensors):
+                    continue
+                try:
+                    os.link(src, q)
+                except OSError:
+                    os.symlink(os.path.abspath(src), q)
+                print(f'{q.name}: no expert tensors, linked to {src} (quantize skips it)')
+            a.quant_out = base + '.gguf'  # quantize --keep-split appends -0000N-of-0000M.gguf to the name without .gguf
         cmd += ['--custom-q', ','.join(rules), str(outs[0]), a.quant_out, 'Q8_0', str(a.threads)]
         print('running', ' '.join(cmd[:3]), '...', ' '.join(cmd[-4:]), flush=True)
         rc = subprocess.run(cmd).returncode
