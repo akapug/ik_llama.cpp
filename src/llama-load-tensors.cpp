@@ -3563,9 +3563,11 @@ bool create_tensors_helper::create_deepseek4_tensors(const LLM_TN & tn) {
         layer.ffn_norm       = create_tensor_from_meta(ctx_split, format("blk.%d.ffn_norm.weight", i));
         layer.ffn_gate_inp   = create_tensor_from_meta(ctx_split, format("blk.%d.ffn_gate_inp.weight", i));
         layer.ffn_exp_probs_b = create_tensor_from_meta(ctx_split, format("blk.%d.exp_probs_b.bias", i));
-        layer.ffn_gate_exps  = create_tensor_from_meta(ctx_split, format("blk.%d.ffn_gate_exps.weight", i));
-        layer.ffn_down_exps  = create_tensor_from_meta(ctx_split, format("blk.%d.ffn_down_exps.weight", i));
-        layer.ffn_up_exps    = create_tensor_from_meta(ctx_split, format("blk.%d.ffn_up_exps.weight", i));
+        if (!create_split_ffn_exps(i, 0, ctx_split)) {
+            layer.ffn_gate_exps  = create_tensor_from_meta(ctx_split, format("blk.%d.ffn_gate_exps.weight", i));
+            layer.ffn_down_exps  = create_tensor_from_meta(ctx_split, format("blk.%d.ffn_down_exps.weight", i));
+            layer.ffn_up_exps    = create_tensor_from_meta(ctx_split, format("blk.%d.ffn_up_exps.weight", i));
+        }
         layer.ffn_gate_shexp = create_tensor_from_meta(ctx_split, format("blk.%d.ffn_gate_shexp.weight", i));
         layer.ffn_down_shexp = create_tensor_from_meta(ctx_split, format("blk.%d.ffn_down_shexp.weight", i));
         layer.ffn_up_shexp   = create_tensor_from_meta(ctx_split, format("blk.%d.ffn_up_shexp.weight", i));

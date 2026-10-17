@@ -19,9 +19,19 @@ the loader ignores: it reads the count from the first shard only).
 --imatrix IN.dat --imatrix-out OUT.dat slices an imatrix (.dat, the format llama-quantize reads) the same way: entries
 for the partition tensors with the matching expert rows (the gate entry falls back to up, as quantize does).
 
+Per-partition types (--type, repeatable): the split itself only copies bytes; the types are applied by llama-quantize
+with --custom-q rules that this script writes (--quant-rules FILE, also with --dry-run), and runs with --quantize-bin.
+  --type TAG[.ROLE][@LAYERS]=TYPE   ROLE in up/gate/down/gate_up, LAYERS like 0-9,20; TYPE a ggml type name
+                                    (case-insensitive: q2_K, iq2_ks, q3_K ...) or 'keep' (= the source type, bytes copied)
+  First matching --type wins; a partition tensor no rule matches keeps its source type. The rules also pin every
+  non-expert tensor to its source type, so quantize changes nothing but the listed partitions. Example (hot keeps the
+  native MXFP4, cold q2_K with q3_K down on layers 0-9):
+    --type hot=keep --type cold.down@0-9=q3_K --type cold=q2_K
+
 usage: split_experts.py IN.gguf OUT.gguf --part hot=hot.tsv [--part warm=warm.json] [--rest cold] [--imatrix ...]
+                        [--type SPEC ... --quant-rules RULES.txt [--quantize-bin DIR --quant-out OUT-mixed.gguf]]
 """
-import argparse, json, os, re, struct, sys
+import argparse, json, os, re, struct, subprocess, sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'gguf-py'))
@@ -250,6 +260,72 @@ def slice_imatrix(src, dst, plan):
     print(f'imatrix: {len(entries)} entries in, {made} partition entries added -> {dst}')
 
 
+ROLES = ('up', 'gate', 'down', 'gate_up')
+# tensors llama-quantize never converts (int types); everything else that is >= 2D and ends in 'weight' it may touch
+NO_QUANT = {'I8', 'I16', 'I32', 'I64', 'BF16_R16'}
+
+
+def ggml_type_names():
+    """lower-case name -> ggml's own spelling (llama-quantize matches type names exactly)."""
+    src = Path(__file__).resolve().parent.parent / 'ggml' / 'src' / 'ggml.c'
+    names = re.findall(r'\.type_name\s*=\s*"([^"]+)"', src.read_text(errors='replace')) if src.exists() else []
+    out = {n.lower(): n for n in names if n != 'DEPRECATED'}
+    if not out:  # no ggml source next to the script: the common spelling (k-quants keep a capital K)
+        for t in gguf.GGMLQuantizationType:
+            n = t.name.lower()
+            out[n] = re.sub(r'^(q\d)_k$', r'\1_K', n)
+    return out
+
+
+def parse_type_spec(spec, names):
+    """'TAG[.ROLE][@LAYERS]=TYPE' -> (tag, role or None, layer set or None, type name or 'keep')"""
+    m = re.fullmatch(r'([a-z0-9]+)(?:\.([a-z_]+))?(?:@([0-9,\-]+))?=([A-Za-z0-9_]+)', spec)
+    if not m or m.group(1) not in TAGS or (m.group(2) and m.group(2) not in ROLES):
+        raise SystemExit(f'--type {spec}: expected TAG[.ROLE][@LAYERS]=TYPE, TAG in {TAGS}, ROLE in {ROLES}')
+    typ = m.group(4)
+    if typ.lower() != 'keep':
+        if typ.lower() not in names:
+            raise SystemExit(f'--type {spec}: unknown ggml type {typ!r}')
+        typ = names[typ.lower()]
+    else:
+        typ = 'keep'
+    return m.group(1), m.group(2), set(parse_ids(m.group(3))) if m.group(3) else None, typ
+
+
+def alt(ids):
+    return '(' + '|'.join(str(i) for i in sorted(ids)) + ')'
+
+
+def quant_rules(readers, plan, specs, names):
+    """-> (list of 'regex=type' rules for llama-quantize --custom-q, {(tag, type): n_tensors})"""
+    src_name = lambda t: names.get(t.tensor_type.name.lower(), t.tensor_type.name.lower())
+    exp, pin, summary = {}, {}, {}
+    for r in readers:
+        for t in r.tensors:
+            m = EXP_RE.match(t.name)
+            if m:
+                il, role = int(m.group(1)), m.group(2)
+                for p in plan[il][3]:
+                    tag = TAGS[p]
+                    typ = next((ty for tg, ro, ls, ty in specs if tg == tag and ro in (None, role) and (ls is None or il in ls)), 'keep')
+                    typ = src_name(t) if typ == 'keep' else typ
+                    exp.setdefault((role, tag, typ), []).append(il)
+                    summary[(tag, typ)] = summary.get((tag, typ), 0) + 1
+                continue
+            if t.tensor_type.name in NO_QUANT or len(t.shape) < 2 or not t.name.endswith('weight'):
+                continue
+            mb = re.match(r'^blk\.(\d+)\.(.*)$', t.name)
+            key = (mb.group(2), src_name(t)) if mb else (t.name, src_name(t))
+            pin.setdefault(key, []).append(int(mb.group(1)) if mb else None)
+    rules = [rf'^blk\.{alt(ls)}\.ffn_{role}_exps_{tag}\.weight$={typ}' for (role, tag, typ), ls in sorted(exp.items())]
+    for (stem, typ), ls in sorted(pin.items()):
+        rules.append(rf'^{re.escape(stem)}$={typ}' if ls == [None] else rf'^blk\.{alt(ls)}\.{re.escape(stem)}$={typ}')
+    bad = [x for x in rules if ',' in x or x.count('=') != 1]
+    if bad:
+        raise SystemExit(f'cannot express these rules for --custom-q (comma or extra "="): {bad[:3]}')
+    return rules, summary
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('input')
@@ -260,6 +336,11 @@ def main():
     ap.add_argument('--imatrix-out')
     ap.add_argument('--no-link-unchanged', action='store_true')
     ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--type', action='append', default=[], metavar='TAG[.ROLE][@LAYERS]=TYPE')
+    ap.add_argument('--quant-rules', metavar='FILE', help='write the llama-quantize --custom-q rule string here')
+    ap.add_argument('--quantize-bin', metavar='DIR', help='run DIR/llama-quantize on the split output with the rules')
+    ap.add_argument('--quant-out', metavar='OUT.gguf')
+    ap.add_argument('--threads', type=int, default=os.cpu_count())
     a = ap.parse_args()
 
     lists = []
@@ -296,6 +377,19 @@ def main():
         if tag in sizes:
             print(f'  {tag:5s} {counts[tag]:6d} experts {sizes[tag] / 2**30:9.2f} GiB (source types)')
 
+    rules = None
+    if a.type or a.quant_rules or a.quantize_bin:
+        names = ggml_type_names()
+        specs = [parse_type_spec(x, names) for x in a.type]
+        rules, summary = quant_rules(readers, plan, specs, names)
+        for (tag, typ), n in sorted(summary.items()):
+            print(f'  type  {tag:5s} {typ:8s} {n:5d} tensors')
+        if a.quant_rules:
+            Path(a.quant_rules).write_text(','.join(rules) + '\n')
+            print(f'{len(rules)} quantize rules -> {a.quant_rules}')
+    if a.quantize_bin and not (a.output and a.quant_out):
+        raise SystemExit('--quantize-bin needs OUTPUT and --quant-out')
+
     if a.imatrix:
         if not a.imatrix_out:
             raise SystemExit('--imatrix needs --imatrix-out')
@@ -325,6 +419,18 @@ def main():
             continue
         n = write_shard(r, dst, plan, n_total, info, set(mp))
         print(f'{dst.name}: {n} tensors written')
+    if a.quantize_bin:
+        # Q8_0 is only the fallback type: every tensor quantize may touch is pinned by a rule
+        cmd = [str(Path(a.quantize_bin) / 'llama-quantize'), '--allow-requantize']
+        if a.imatrix_out:
+            cmd += ['--imatrix', a.imatrix_out]
+        if n_split:
+            cmd += ['--keep-split']
+        cmd += ['--custom-q', ','.join(rules), str(outs[0]), a.quant_out, 'Q8_0', str(a.threads)]
+        print('running', ' '.join(cmd[:3]), '...', ' '.join(cmd[-4:]), flush=True)
+        rc = subprocess.run(cmd).returncode
+        if rc:
+            raise SystemExit(f'llama-quantize rc={rc}')
 
 
 if __name__ == '__main__':
