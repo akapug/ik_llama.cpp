@@ -5351,9 +5351,12 @@ static bool llm_load_tensors(
     // load tensor data
     if (!dry_run) {
         // bind expert byte ranges to NUMA nodes before the data is read, so pages fault onto their target node
-        // under --no-mmap with deferred tables (defer_copy_dense) the loader allocates each dense/expert buffer while it
-        // reads it, so there is nothing to bind yet: placement runs after the load and migrates the pages instead
-        if (!ml.defer_copy_dense) llama_expert_numa_apply(model, ml.use_mmap);
+        // under --no-mmap with deferred tables (defer_copy_dense), and under -rtr with deferred tables (repackable
+        // tensors are streamed into owned buffers while use_mmap stays on for the tables), the loader allocates the expert
+        // buffers while it reads them, so there is nothing to bind yet: placement runs after the load and migrates the
+        // pages instead (before the in-place repack below, which keeps them where they are)
+        const bool place_after_load = ml.defer_copy_dense || (keep_ple_mapping && ml.repack_tensors);
+        if (!place_after_load) llama_expert_numa_apply(model, ml.use_mmap);
         for (auto & it : ctx_bufs) {
             ggml_context * ctx = it.first;
             auto & bufs = it.second;
@@ -5362,7 +5365,7 @@ static bool llm_load_tensors(
             }
         }
 
-        if (ml.defer_copy_dense) llama_expert_numa_apply(model, false);
+        if (place_after_load) llama_expert_numa_apply(model, false);
         llama_expert_numa_report(model);
 
         if (defer_expert_mmap) {
