@@ -312,6 +312,20 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_exps  = nullptr;
     struct ggml_tensor * ffn_up_gate_exps  = nullptr;
 
+    // routed experts split by expert into partitions (split_experts.py): each partition holds a subset of the
+    // experts in its own tensors (own type), the full ffn_*_exps tensors above are then nullptr.
+    // ffn_exps_part_map = [2][n_expert]: partition tag (llama_expert_part_tag) and the expert's index in it.
+    struct expert_part {
+        int tag = -1;
+        struct ggml_tensor * up = nullptr;
+        struct ggml_tensor * gate = nullptr;
+        struct ggml_tensor * up_gate = nullptr;
+        struct ggml_tensor * down = nullptr;
+    };
+    std::vector<expert_part> ffn_exps_parts;
+    struct ggml_tensor * ffn_exps_part = nullptr;
+    std::vector<int32_t> ffn_exps_part_map;
+
     llama_split_tensor split_ffn_gate_inp;
     llama_split_tensor split_ffn_up_exps;
     llama_split_tensor split_ffn_gate_exps;

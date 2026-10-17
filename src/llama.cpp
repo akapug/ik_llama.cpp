@@ -10038,15 +10038,12 @@ struct llama_context * llama_init_from_model(
             }
 
             try {
-                ctx->hot_experts = llama_hot_experts::create(*model, ctx->backends, backend_buft);
+                // split expert tensors always need their partitions; GPU banks are skipped under --moe-cache-mib
+                ctx->hot_experts = llama_hot_experts::create(*model, ctx->backends, backend_buft, !ctx->moe_cache);
             } catch (const std::exception & e) {
                 LLAMA_LOG_ERROR("%s: failed to initialize hot experts: %s\n", __func__, e.what());
                 llama_free(ctx);
                 return nullptr;
-            }
-            if (ctx->hot_experts && ctx->moe_cache) {
-                LLAMA_LOG_WARN("%s: --moe-cache-mib is active; LLAMA_HOT_EXPERTS is ignored\n", __func__);
-                ctx->hot_experts.reset();
             }
 
             // build worst-case graph
