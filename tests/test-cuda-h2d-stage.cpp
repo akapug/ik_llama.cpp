@@ -4,6 +4,7 @@
 
 #include "../ggml/src/ggml-cuda/h2d-stage.h"
 
+#include <chrono>
 #include <cstdio>
 #include <map>
 #include <string>
@@ -96,10 +97,38 @@ static void test_pool() {
     }
 }
 
+#ifdef __linux__
+// copy threads must run on the process mask taken at static init, not on the one CPU the creating thread was pinned
+// to (ggml pins the main thread with -cr; a pool started from it would copy on a single core)
+static void test_affinity() {
+    const int all = CPU_COUNT(&hs::g_initial_affinity);
+    CHECK(all >= 1);
+    int first = -1;
+    for (int i = 0; i < CPU_SETSIZE && first < 0; ++i) if (CPU_ISSET(i, &hs::g_initial_affinity)) first = i;
+    cpu_set_t one, saved;
+    CPU_ZERO(&one);
+    CPU_SET(first, &one);
+    pthread_getaffinity_np(pthread_self(), sizeof(saved), &saved);
+    pthread_setaffinity_np(pthread_self(), sizeof(one), &one);
+    {
+        hs::copy_pool pool(4);
+        for (int i = 1; i < 4; ++i) {
+            int c = 0;
+            for (int k = 0; k < 2000 && (c = pool.cpus_of(i)) == 0; ++k) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            CHECK(c == all);
+        }
+    }
+    pthread_setaffinity_np(pthread_self(), sizeof(saved), &saved);
+}
+#endif
+
 int main() {
     test_settings();
     test_slices();
     test_pool();
+#ifdef __linux__
+    test_affinity();
+#endif
     if (failures) {
         fprintf(stderr, "test-cuda-h2d-stage: %d failure(s)\n", failures);
         return 1;
