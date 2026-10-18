@@ -5635,9 +5635,41 @@ GGML_CALL static bool ggml_backend_cuda_supports_buft(ggml_backend_t backend, gg
     return false;
 }
 
+// research (droopy prefill lane): GGML_CUDA_OFFLOAD_BATCH_FILE=<path> overrides offload-batch-size with the integer in
+// that file, re-read at most every GGML_CUDA_OFFLOAD_BATCH_FILE_MS (default 500) ms, so one model load can measure
+// offloaded and CPU prefill back to back (ABA). A missing or unparsable file keeps the configured value.
+static int ggml_cuda_offload_batch_override(int configured) {
+    static const char * path = getenv("GGML_CUDA_OFFLOAD_BATCH_FILE");
+    if (path == nullptr || *path == 0) {
+        return configured;
+    }
+    static const int64_t period_us = [] {
+        const char * e = getenv("GGML_CUDA_OFFLOAD_BATCH_FILE_MS");
+        return (int64_t) (e ? std::max(0, atoi(e)) : 500) * 1000;
+    }();
+    static std::atomic<int64_t> next_us{0};
+    static std::atomic<int> value{-1};
+    const int64_t now = ggml_time_us();
+    if (now >= next_us.load(std::memory_order_relaxed)) {
+        next_us.store(now + period_us, std::memory_order_relaxed);
+        int v = -1;
+        if (FILE * f = fopen(path, "r")) {
+            if (fscanf(f, "%d", &v) != 1) {
+                v = -1;
+            }
+            fclose(f);
+        }
+        if (v != value.exchange(v)) {
+            GGML_CUDA_LOG_INFO("%s: offload-batch-size %d from %s\n", __func__, v >= 0 ? v : configured, path);
+        }
+    }
+    const int v = value.load(std::memory_order_relaxed);
+    return v >= 0 ? v : configured;
+}
+
 GGML_CALL static bool ggml_backend_cuda_offload_op(ggml_backend_t backend, const ggml_tensor * op) {
     auto ctx = (ggml_backend_cuda_context *)backend->context;
-    int min_batch_size = ctx->offload_batch_size; // originally: GGML_CUDA_MIN_BATCH_OFFLOAD;
+    int min_batch_size = ggml_cuda_offload_batch_override(ctx->offload_batch_size); // originally: GGML_CUDA_MIN_BATCH_OFFLOAD;
 
     // Why do we want to do this? The heuristics that the batch must have more than min_batch_size tokens to be worth it
     // offloading the required model weights comes from dense models. For MoE models, the average number of tokens
