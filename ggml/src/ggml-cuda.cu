@@ -65,6 +65,7 @@
 #include "ggml-cuda/indexer_topk.cuh"
 #include "ggml-cuda/ds4_comp.cuh"
 #include "ggml-cuda/pin-budget.h"
+#include "ggml-cuda/h2d-stage.h"
 
 #include <algorithm>
 #include <array>
@@ -4507,9 +4508,12 @@ GGML_CALL static const char * ggml_backend_cuda_name(ggml_backend_t backend) {
     return cuda_ctx->name.c_str();
 }
 
+static void ggml_cuda_h2d_report(int device);
+
 GGML_CALL static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    ggml_cuda_h2d_report(cuda_ctx->device);
     delete cuda_ctx;
     delete backend;
 }
@@ -4520,6 +4524,109 @@ GGML_CALL static ggml_backend_buffer_type_t ggml_backend_cuda_get_default_buffer
     return ggml_backend_cuda_buffer_type(cuda_ctx->device);
 }
 
+// Pageable host -> device through a per-device ring of pinned chunks (ggml-cuda/h2d-stage.h). Returns false when the
+// copy should take the driver path: staging off or unavailable, a small copy, or a source that is already pinned.
+// On return the source has been read in full (as with a pageable cudaMemcpyAsync); the device writes are ordered on
+// stream.
+struct ggml_cuda_h2d_stager {
+    std::mutex mu;
+    bool tried = false;
+    bool ok = false;
+    ggml_cuda_h2d_stage::settings cfg;
+    ggml_backend_buffer_t ring = nullptr;
+    std::vector<cudaEvent_t> ev;
+    std::vector<bool> pending;
+    int next = 0;
+    std::unique_ptr<ggml_cuda_h2d_stage::copy_pool> pool;
+    uint64_t bytes = 0, calls = 0;
+    int64_t host_us = 0;
+};
+
+static ggml_cuda_h2d_stager g_cuda_h2d[GGML_CUDA_MAX_DEVICES];
+
+static bool ggml_cuda_h2d_stager_init(ggml_cuda_h2d_stager & st, int device) {
+    st.tried = true;
+    st.cfg = ggml_cuda_h2d_stage::from_env();
+    if (!st.cfg.enabled) {
+        return false;
+    }
+    const size_t total = st.cfg.chunk * st.cfg.bufs;
+    st.ring = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_host_buffer_type(), total);
+    cudaPointerAttributes attr = {};
+    const bool pinned = st.ring != nullptr && cudaPointerGetAttributes(&attr, ggml_backend_buffer_get_base(st.ring)) == cudaSuccess &&
+                        attr.type == cudaMemoryTypeHost;
+    if (!pinned) {
+        cudaGetLastError();
+        if (st.ring) {
+            ggml_backend_buffer_free(st.ring);
+            st.ring = nullptr;
+        }
+        GGML_CUDA_LOG_INFO("%s: device %d: no pinned ring of %.0f MiB (GGML_CUDA_NO_PINNED without GGML_CUDA_PIN_STAGING, "
+                           "or GGML_CUDA_PIN_MAX_MIB full): pageable host -> device copies keep the driver path\n",
+                           __func__, device, total / 1048576.0);
+        return false;
+    }
+    st.ev.resize(st.cfg.bufs);
+    for (auto & e : st.ev) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    }
+    st.pending.assign(st.cfg.bufs, false);
+    st.pool = std::make_unique<ggml_cuda_h2d_stage::copy_pool>(st.cfg.threads);
+    GGML_CUDA_LOG_INFO("%s: device %d: pageable host -> device copies >= %zu KiB go through %d pinned chunks of %zu MiB, "
+                       "%d copy threads (GGML_CUDA_H2D_STAGE=0 turns this off)\n", __func__, device,
+                       st.cfg.min_bytes >> 10, st.cfg.bufs, st.cfg.chunk >> 20, st.cfg.threads);
+    return true;
+}
+
+static bool ggml_cuda_h2d_staged(int device, cudaStream_t stream, void * dst, const void * src, size_t size) {
+    ggml_cuda_h2d_stager & st = g_cuda_h2d[device];
+    std::lock_guard<std::mutex> lk(st.mu);
+    if (!st.tried) {
+        st.ok = ggml_cuda_h2d_stager_init(st, device);
+    }
+    if (!st.ok || size < st.cfg.min_bytes) {
+        return false;
+    }
+    cudaPointerAttributes attr = {};
+    if (cudaPointerGetAttributes(&attr, src) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    if (attr.type != cudaMemoryTypeUnregistered) {
+        return false;   // pinned host, device or managed memory: the driver copies it directly
+    }
+    const int64_t t0 = ggml_time_us();
+    char * base = (char *) ggml_backend_buffer_get_base(st.ring);
+    for (size_t off = 0; off < size; off += st.cfg.chunk) {
+        const size_t n = std::min(st.cfg.chunk, size - off);
+        const int b = st.next;
+        st.next = (st.next + 1) % st.cfg.bufs;
+        if (st.pending[b]) {
+            CUDA_CHECK(cudaEventSynchronize(st.ev[b]));   // the DMA that read this chunk last time is done
+        }
+        char * stage = base + (size_t) b * st.cfg.chunk;
+        st.pool->copy(stage, (const char *) src + off, n);
+        CUDA_CHECK(cudaMemcpyAsync((char *) dst + off, stage, n, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaEventRecord(st.ev[b], stream));
+        st.pending[b] = true;
+    }
+    st.host_us += ggml_time_us() - t0;
+    st.bytes += size;
+    st.calls += 1;
+    return true;
+}
+
+static void ggml_cuda_h2d_report(int device) {
+    ggml_cuda_h2d_stager & st = g_cuda_h2d[device];
+    std::lock_guard<std::mutex> lk(st.mu);
+    if (st.calls == 0) {
+        return;
+    }
+    GGML_CUDA_LOG_INFO("%s: device %d: staged %.2f GiB in %llu copies, %.2f s on the host (%.2f GB/s incl. DMA waits)\n",
+                       __func__, device, st.bytes / 1073741824.0, (unsigned long long) st.calls, st.host_us / 1e6,
+                       st.host_us > 0 ? st.bytes / 1e3 / st.host_us : 0.0);
+}
+
 GGML_CALL static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
@@ -4527,7 +4634,9 @@ GGML_CALL static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend,
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     ggml_cuda_set_device(cuda_ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    if (!ggml_cuda_h2d_staged(cuda_ctx->device, cuda_ctx->stream(), (char *)tensor->data + offset, data, size)) {
+        CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    }
     ggml_hostcut_count(GGML_HC_SET_ASYNC, 1);
 }
 
