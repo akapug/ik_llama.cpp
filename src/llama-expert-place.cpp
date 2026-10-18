@@ -380,6 +380,13 @@ const char * llama_expert_part_tag(int tag) {
     return tag >= 0 && tag < LLAMA_EXPERT_PART_MAX ? tags[tag] : "?";
 }
 
+struct llama_hot_banks {
+    struct bank { ggml_tensor * t; std::vector<int32_t> slices; }; // slices: source expert indices, in bank order
+    std::map<std::string, bank> by_name;          // "hot.<source tensor name>" -> bank
+    std::vector<ggml_context_ptr> ctxs;
+    std::vector<ggml_backend_buffer_ptr> bufs;
+};
+
 struct llama_hot_experts::impl {
     struct layer {
         std::vector<part> small; // batches <= max_batch (with GPU banks)
@@ -387,8 +394,9 @@ struct llama_hot_experts::impl {
         bool active = false;
     };
     std::vector<layer> layers;
-    std::vector<ggml_context_ptr> ctxs;
+    std::vector<ggml_context_ptr> ctxs;           // per-context maps
     std::vector<ggml_backend_buffer_ptr> bufs;
+    std::shared_ptr<llama_hot_banks> banks;       // GPU banks, shared with the model's other contexts
     int64_t max_batch = 8;
 };
 
@@ -542,26 +550,41 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
     struct map_fill  { ggml_tensor * map; std::vector<int32_t> values; };
     std::vector<bank_fill> bank_fills;
     std::vector<map_fill> map_fills;
-    std::map<int, ggml_context *> ctx_of;       // backend index -> metadata context (maps + banks)
+    std::map<int, ggml_context *> ctx_of;       // backend index -> metadata context of this context's maps
+    std::map<int, ggml_context *> bank_ctx_of;  // backend index -> metadata context of new banks (owned by the model)
     std::map<int, ggml_backend_buffer_type_t> buft_of;
-    auto new_ctx = [&](int b, ggml_backend_buffer_type_t buft) {
-        auto it = ctx_of.find(b);
-        if (it != ctx_of.end()) return it->second;
+    auto banks = model.hot_banks.lock();        // banks another context of this model already holds
+    std::vector<ggml_context_ptr> bank_ctxs;
+    auto new_ctx = [&](int b, ggml_backend_buffer_type_t buft, bool bank) {
+        auto & of = bank ? bank_ctx_of : ctx_of;
+        auto it = of.find(b);
+        if (it != of.end()) return it->second;
         ggml_init_params ip = { 8 * LLAMA_EXPERT_PART_MAX * model.layers.size() * ggml_tensor_overhead(), nullptr, true };
         ggml_context * c = ggml_init(ip);
         if (!c) throw std::runtime_error("hot experts: ggml_init failed");
-        p.ctxs.emplace_back(c);
+        (bank ? bank_ctxs : p.ctxs).emplace_back(c);
         buft_of[b] = buft;
-        return ctx_of[b] = c;
+        return of[b] = c;
+    };
+    // a bank of this model on this buffer type with this type and shape, or nullptr
+    auto shared_bank = [&](const std::string & name, ggml_type type, const ggml_tensor * src, const std::vector<int32_t> & slices,
+            ggml_backend_buffer_type_t buft) -> ggml_tensor * {
+        if (!banks) return nullptr;
+        auto it = banks->by_name.find(name);
+        if (it == banks->by_name.end()) return nullptr;
+        ggml_tensor * t = it->second.t;
+        const bool same = it->second.slices == slices && t->type == type && t->ne[0] == src->ne[0] && t->ne[1] == src->ne[1] &&
+                t->buffer && ggml_backend_buffer_get_type(t->buffer) == buft;
+        return same ? t : nullptr;
     };
     auto new_map = [&](int b, ggml_backend_buffer_type_t buft, std::vector<int32_t> values, const char * what, int il, const char * tag) {
-        ggml_tensor * m = ggml_new_tensor_2d(new_ctx(b, buft), GGML_TYPE_I32, 1, n_exp);
+        ggml_tensor * m = ggml_new_tensor_2d(new_ctx(b, buft, false), GGML_TYPE_I32, 1, n_exp);
         ggml_format_name(m, "%s.map-%s-%d", what, tag, il);
         map_fills.push_back({ m, std::move(values) });
         return m;
     };
 
-    size_t n_hot = 0, n_split = 0, n_bank_layers = 0;
+    size_t n_hot = 0, n_split = 0, n_bank_layers = 0, n_shared = 0, shared_bytes = 0;
     for (size_t il = 0; il < model.layers.size(); ++il) {
         const llama_layer & l = model.layers[il];
         const bool is_split = !l.ffn_exps_parts.empty();
@@ -634,7 +657,6 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
         if (!want.empty()) {
             for (const auto & s : sources) {
                 if (s.banked.empty()) continue;
-                ggml_context * c = new_ctx(device, bufts[device]);
                 const int K = (int) s.banked.size();
                 part q;
                 q.backend = backends[device];
@@ -646,10 +668,18 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
                     const ggml_tensor * src = *pt;
                     if (!src) continue;
                     // a repacked source keeps the base row size, so an un-repacked bank has the same expert stride
-                    ggml_tensor * bank = ggml_new_tensor_3d(c, bank_type(device, src), src->ne[0], src->ne[1], K);
-                    if (bank->nb[2] != src->nb[2]) throw std::runtime_error("hot experts: bank layout differs from the source tensor");
-                    ggml_format_name(bank, "hot.%s", src->name);
-                    bank_fills.push_back({ bank, src, slices });
+                    const ggml_type type = bank_type(device, src);
+                    const std::string name = (std::string("hot.") + src->name).substr(0, GGML_MAX_NAME - 1);
+                    ggml_tensor * bank = shared_bank(name, type, src, slices, bufts[device]);
+                    if (bank) {
+                        ++n_shared;
+                        shared_bytes += ggml_nbytes(bank);
+                    } else {
+                        bank = ggml_new_tensor_3d(new_ctx(device, bufts[device], true), type, src->ne[0], src->ne[1], K);
+                        if (bank->nb[2] != src->nb[2]) throw std::runtime_error("hot experts: bank layout differs from the source tensor");
+                        ggml_set_name(bank, name.c_str());
+                        bank_fills.push_back({ bank, src, slices });
+                    }
                     if (pt == &s.w.up) q.up = bank; else if (pt == &s.w.gate) q.gate = bank; else if (pt == &s.w.up_gate) q.up_gate = bank; else q.down = bank;
                 }
                 std::vector<int32_t> hm(n_exp, -1);
@@ -670,13 +700,16 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
     }
 
     size_t dev_bytes = 0;
-    for (auto & [b, c] : ctx_of) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(c, buft_of[b]);
-        if (!buf) throw std::runtime_error(ggml_backend_is_cpu(backends[b]) ? "hot experts: host map allocation failed" :
-                "hot experts: GPU bank allocation failed (lower the budget)");
-        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        if (!ggml_backend_is_cpu(backends[b])) dev_bytes += ggml_backend_buffer_get_size(buf);
-        p.bufs.emplace_back(buf);
+    std::vector<ggml_backend_buffer_ptr> bank_bufs;
+    for (auto * of : { &ctx_of, &bank_ctx_of }) {
+        for (auto & [b, c] : *of) {
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(c, buft_of[b]);
+            if (!buf) throw std::runtime_error(ggml_backend_is_cpu(backends[b]) ? "hot experts: host map allocation failed" :
+                    "hot experts: GPU bank allocation failed (lower the budget)");
+            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            if (!ggml_backend_is_cpu(backends[b])) dev_bytes += ggml_backend_buffer_get_size(buf);
+            (of == &bank_ctx_of ? bank_bufs : p.bufs).emplace_back(buf);
+        }
     }
     size_t n_unrepacked = 0;
     std::vector<uint8_t> staging;
@@ -703,12 +736,26 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
     }
     for (const auto & f : map_fills) ggml_backend_tensor_set(f.map, f.values.data(), 0, f.values.size() * sizeof(int32_t));
 
+    // filled banks join the model's shared set (created on first use); this context keeps the set alive
+    if (!bank_ctxs.empty()) {
+        if (!banks) banks = std::make_shared<llama_hot_banks>();
+        for (const auto & f : bank_fills) banks->by_name[ggml_get_name(f.bank)] = { f.bank, f.slices };
+        for (auto & c : bank_ctxs) banks->ctxs.push_back(std::move(c));
+        for (auto & b : bank_bufs) banks->bufs.push_back(std::move(b));
+        model.hot_banks = banks;
+    }
+    if (n_hot) p.banks = banks;
+
     if (n_split) {
         LLAMA_LOG_INFO("llama_hot_experts: %zu layers with split expert tensors (every batch runs one chain per partition)\n", n_split);
     }
     if (n_bank_layers) {
         LLAMA_LOG_INFO("llama_hot_experts: %s: %zu hot experts in %zu layers, %.2f MiB on GPU, banks for batches <= %lld tokens\n",
                 path, n_hot, n_bank_layers, dev_bytes / 1048576.0, (long long) p.max_batch);
+        if (n_shared) {
+            LLAMA_LOG_INFO("llama_hot_experts: %zu bank tensors (%.2f MiB) shared with another context of this model, not allocated again\n",
+                    n_shared, shared_bytes / 1048576.0);
+        }
         if (n_unrepacked) {
             LLAMA_LOG_INFO("llama_hot_experts: %zu expert tensor slices un-repacked from run-time repacked (-rtr) host tensors\n", n_unrepacked);
         }
