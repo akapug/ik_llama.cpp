@@ -2226,6 +2226,17 @@ bool common_speculative_prepare_mtp_runtime(
     params.cparams_dft.mtp_op_type = MTP_OP_WARMUP;
     params.cparams_dft.embeddings  = true;
 
+    // LLAMA_MTP_UBATCH=N caps the MTP context's micro-batch (default: the target's -ub). Its compute buffer scales
+    // with the micro-batch (a 4096-token ubatch costs as much VRAM as the target's own buffer); prompt warm-up batches
+    // still arrive whole (n_batch is unchanged) and are split into N-token micro-batches.
+    if (const char * u = getenv("LLAMA_MTP_UBATCH")) {
+        const int n = atoi(u);
+        if (n > 0 && (uint32_t) n < params.cparams_dft.n_ubatch) {
+            LOG_INF("%s: LLAMA_MTP_UBATCH: MTP context micro-batch %u -> %d\n", __func__, params.cparams_dft.n_ubatch, n);
+            params.cparams_dft.n_ubatch = (uint32_t) n;
+        }
+    }
+
     return true;
 }
 
