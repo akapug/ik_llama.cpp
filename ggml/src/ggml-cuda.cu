@@ -4572,9 +4572,14 @@ static bool ggml_cuda_h2d_stager_init(ggml_cuda_h2d_stager & st, int device) {
     }
     st.pending.assign(st.cfg.bufs, false);
     st.pool = std::make_unique<ggml_cuda_h2d_stage::copy_pool>(st.cfg.threads);
+#ifdef __linux__
+    const int n_cpus = CPU_COUNT(&ggml_cuda_h2d_stage::g_initial_affinity);
+#else
+    const int n_cpus = 0;
+#endif
     GGML_CUDA_LOG_INFO("%s: device %d: pageable host -> device copies >= %zu KiB go through %d pinned chunks of %zu MiB, "
-                       "%d copy threads (GGML_CUDA_H2D_STAGE=0 turns this off)\n", __func__, device,
-                       st.cfg.min_bytes >> 10, st.cfg.bufs, st.cfg.chunk >> 20, st.cfg.threads);
+                       "%d copy threads on the process mask (%d CPUs) (GGML_CUDA_H2D_STAGE=0 turns this off)\n", __func__,
+                       device, st.cfg.min_bytes >> 10, st.cfg.bufs, st.cfg.chunk >> 20, st.cfg.threads, n_cpus);
     return true;
 }
 

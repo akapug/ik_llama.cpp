@@ -26,8 +26,25 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 namespace ggml_cuda_h2d_stage {
+
+#ifdef __linux__
+// The process CPU mask at static init (numactl --physcpubind), taken before ggml pins the calling thread to one CPU
+// (-cr): copy threads started later from that thread would inherit its single CPU.
+inline const cpu_set_t g_initial_affinity = [] {
+    cpu_set_t m;
+    CPU_ZERO(&m);
+    if (sched_getaffinity(0, sizeof(m), &m) != 0) {
+        for (int i = 0; i < CPU_SETSIZE; ++i) CPU_SET(i, &m);
+    }
+    return m;
+}();
+#endif
 
 constexpr int    k_default_enabled = 1;
 constexpr size_t k_default_chunk_mib = 32;
@@ -83,9 +100,21 @@ inline void slice(size_t len, int n, int i, size_t & first, size_t & last) {
 // Persistent threads that split one memcpy; the caller copies slice 0 and returns when every slice is done.
 class copy_pool {
 public:
-    explicit copy_pool(int n_threads) : n(std::max(1, n_threads)) {
+    explicit copy_pool(int n_threads) : n(std::max(1, n_threads)), worker_cpus(n, 0) {
         for (int i = 1; i < n; ++i) {
-            workers.emplace_back([this, i] { work(i); });
+            workers.emplace_back([this, i] {
+#ifdef __linux__
+                pthread_setaffinity_np(pthread_self(), sizeof(g_initial_affinity), &g_initial_affinity);
+                cpu_set_t mask;
+                CPU_ZERO(&mask);
+                pthread_getaffinity_np(pthread_self(), sizeof(mask), &mask);
+                {
+                    std::lock_guard<std::mutex> lk(m);
+                    worker_cpus[i] = CPU_COUNT(&mask);
+                }
+#endif
+                work(i);
+            });
         }
     }
     ~copy_pool() {
@@ -102,6 +131,12 @@ public:
     copy_pool & operator=(const copy_pool &) = delete;
 
     int size() const { return n; }
+
+    // CPUs in worker i's mask once it started (0 = not started or not Linux); for tests and logs.
+    int cpus_of(int i) {
+        std::lock_guard<std::mutex> lk(m);
+        return worker_cpus[i];
+    }
 
     // Copies below min_parallel bytes run on the calling thread alone.
     void copy(void * dst, const void * src, size_t len, size_t min_parallel = (size_t) 1 << 20) {
@@ -153,6 +188,7 @@ private:
     }
 
     const int n;
+    std::vector<int> worker_cpus;
     std::vector<std::thread> workers;
     std::mutex m;
     std::condition_variable cv, done;
