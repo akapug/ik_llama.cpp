@@ -15,6 +15,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 int main(int argc, char ** argv) {
     const size_t total = (size_t) (argc > 1 ? atoll(argv[1]) : 2048) << 20;
@@ -30,8 +34,17 @@ int main(int argc, char ** argv) {
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
     if (!buf) { fprintf(stderr, "device alloc of %zu MiB failed\n", total >> 20); return 2; }
 
-    // pageable source, first-touched here (numactl decides the nodes), like --no-mmap expert weights
+    // pageable source, first-touched here (numactl decides the nodes), like --no-mmap expert weights;
+    // H2D_BENCH_SRC_NODE=N binds the source alone to node N (e.g. PMem) while the staging ring follows numactl
     unsigned char * src = (unsigned char *) aligned_alloc(4096, total);
+#ifdef __linux__
+    if (const char * e = getenv("H2D_BENCH_SRC_NODE")) {
+        unsigned long mask = 1ul << atoi(e);
+        if (syscall(SYS_mbind, src, total, 2 /* MPOL_BIND */, &mask, sizeof(mask) * 8, 0) != 0) {
+            perror("mbind"); return 2;
+        }
+    }
+#endif
     uint64_t x = 0x243f6a8885a308d3ull;
     for (size_t i = 0; i < total; i += 8) {
         x ^= x << 13; x ^= x >> 7; x ^= x << 17;
@@ -72,8 +85,8 @@ int main(int argc, char ** argv) {
     ggml_backend_tensor_get(t, back.data(), 0, total);
     bad |= memcmp(back.data(), src, total) != 0;
 
-    printf("h2d-bench mode=%s total_MiB=%zu piece_MiB=%zu reps=%d mean %.2f GB/s best %.2f GB/s bytes %s\n",
-           mode ? mode : "default", total >> 20, piece >> 20, reps, sum / reps, best, bad ? "MISMATCH" : "exact");
+    printf("h2d-bench mode=%s src_node=%s total_MiB=%zu piece_MiB=%zu reps=%d mean %.2f GB/s best %.2f GB/s bytes %s\n",
+           mode ? mode : "default", getenv("H2D_BENCH_SRC_NODE") ? getenv("H2D_BENCH_SRC_NODE") : "numactl", total >> 20, piece >> 20, reps, sum / reps, best, bad ? "MISMATCH" : "exact");
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     ggml_backend_free(be);
