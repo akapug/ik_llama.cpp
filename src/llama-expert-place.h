@@ -13,6 +13,8 @@
 //    batches (decode) the MoE layer runs two paths: the GPU computes the routed
 //    experts that are in the bank, the CPU computes the rest from the full tensors,
 //    and the two outputs are added. Prefill keeps the single CPU path.
+//    The banks belong to the model: every context of the model (the target and an MTP draft context of the
+//    same model) shares one allocation; the maps and backend handles are per context.
 //
 // 3. Split expert tensors (scripts/split_experts.py): a layer's experts live in several
 //    partition tensors (e.g. hot experts MXFP4, cold experts IQ2_KS), each with its own type
@@ -27,6 +29,9 @@
 
 struct llama_model;
 struct ggml_tensor;
+
+// GPU bank tensors of one model, shared by every context of that model (see llama_model::hot_banks)
+struct llama_hot_banks;
 
 // Partition tags of split expert tensors: blk.N.ffn_{up,gate,down}_exps_<tag>.weight (scripts/split_experts.py).
 // The tag index is what blk.N.ffn_exps_part.weight stores.

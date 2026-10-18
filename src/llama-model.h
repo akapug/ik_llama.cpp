@@ -9,11 +9,14 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <memory>
 #include <vector>
 #include <unordered_map>
 #include <set>
 
 #include "llama-reload-info.h"
+
+struct llama_hot_banks;
 
 // available llama models
 enum e_model {
@@ -764,6 +767,10 @@ struct llama_model {
     ggml_backend_buffer_type_t split_buft = nullptr;
 
     std::unique_ptr<reload_info> reload;
+
+    // GPU hot-expert banks (LLAMA_HOT_EXPERTS) are copies of this model's weights: every context of the model
+    // (e.g. the target and its MTP draft) shares one allocation. The contexts own it; the last one frees it.
+    mutable std::weak_ptr<llama_hot_banks> hot_banks;
 };
 
 // Recompute the load-time-derived combined wkv_b (computed_wkv_b) of layer il
