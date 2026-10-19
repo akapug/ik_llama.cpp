@@ -1364,6 +1364,17 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
             throw std::runtime_error("Error: invalid speculative request configuration: " + spec_error);
         }
         common_speculative_prepare_request(slot.spec, slot.params.speculative);
+        // draft_vocab: the MTP draft head for this request (0 = full vocabulary, k = the k-th
+        // LLAMA_MTP_DRAFT_VOCAB head; default the first one when any was built). The head belongs
+        // to the slot's MTP context.
+        if (llama_context * ctx_mtp = slot.spec ? common_speculative_get_companion_ctx(slot.spec) : nullptr) {
+            const int32_t n_dv = llama_model_n_mtp_draft_vocab(llama_get_model(ctx_mtp));
+            const int32_t dv = json_value(data, "draft_vocab", n_dv > 0 ? 1 : 0);
+            if (dv < 0 || dv > n_dv) {
+                throw std::runtime_error("Error: draft_vocab must be in [0, " + std::to_string(n_dv) + "]");
+            }
+            llama_set_mtp_draft_vocab(ctx_mtp, dv);
+        }
     } catch (const std::exception & e) {
         send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST);
         return false;

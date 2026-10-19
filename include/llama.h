@@ -731,6 +731,11 @@ extern "C" {
     // Returns true if the model is openPangu (conv-only recurrent state that rides the spec-rollback checkpoint)
     LLAMA_API bool llama_model_is_openpangu(const struct llama_model * model);
 
+    // Reduced MTP draft heads built at load from LLAMA_MTP_DRAFT_VOCAB (count; 0 = none).
+    LLAMA_API int32_t llama_model_n_mtp_draft_vocab(const struct llama_model * model);
+    // Selects the MTP draft head of this context: 0 = full vocabulary, k = the k-th reduced head.
+    LLAMA_API void llama_set_mtp_draft_vocab(struct llama_context * ctx, int32_t k);
+
     LLAMA_API bool llama_kv_cache_is_compacted(const struct llama_context * ctx);
 
     LLAMA_API llama_pos llama_kv_cache_swa_rewind_floor(const struct llama_context * ctx);

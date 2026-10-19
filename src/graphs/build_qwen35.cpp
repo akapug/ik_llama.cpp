@@ -241,7 +241,7 @@ struct ggml_tensor * llm_build_context::build_qwen35moe_mtp(
 
     cb(cur, "result_norm", -1);
 
-    cur = build_output(lctx, ctx0, cur, model.output_mtp, mtp_layer.nextn.shared_head_norm, cb);
+    cur = build_output(lctx, ctx0, cur, mtp_draft_head(lctx, model.output_mtp), mtp_layer.nextn.shared_head_norm, cb);
     cb(cur, "result_output", -1);
 
     return cur;
@@ -303,7 +303,7 @@ struct ggml_tensor * llm_build_context::build_qwen35_mtp(
     cur = lctx.cvec.apply_to(ctx0, cur, il);
     cb(cur, "ffn_out", il);
 
-    cur = build_output(lctx, ctx0, cur, model.output_mtp, mtp_layer.nextn.shared_head_norm, cb);
+    cur = build_output(lctx, ctx0, cur, mtp_draft_head(lctx, model.output_mtp), mtp_layer.nextn.shared_head_norm, cb);
     cb(cur, "result_output", -1);
 
     return cur;
