@@ -4731,22 +4731,32 @@ static int route_dump_cb(struct ggml_tensor * t, bool ask, void * /*user_data*/)
         }
         return on ? 1 : 0; // 1 = synchronize the backend before the observe call
     }
-    const int32_t layer = atoi(t->name + 13), n_used = (int32_t) t->ne[0], n_tok = (int32_t) t->ne[1];
+    // ggml_top_k names a view of the argsort; some graphs hand the argsort itself (ne[0] = n_expert, k in op_params[1])
+    const int32_t layer = atoi(t->name + 13);
+    const int32_t k = t->op == GGML_OP_ARGSORT && t->op_params[1] > 0 ? t->op_params[1] : (int32_t) t->ne[0];
+    const int64_t rows = t->ne[1] * t->ne[2] * t->ne[3];
+    if (k <= 0 || rows <= 0 || k > t->ne[0] || !t->data) {
+        return 1;
+    }
     if (layer <= prev) {
         ++call; // a new graph evaluation (one ubatch)
     }
     prev = layer;
-    const size_t span = (size_t) (n_tok - 1) * t->nb[1] + (size_t) n_used * sizeof(int32_t);
+    const size_t span = ggml_nbytes(t);
     std::vector<uint8_t> raw(span);
     if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {
         ggml_backend_tensor_get(t, raw.data(), 0, span);
     } else {
         memcpy(raw.data(), t->data, span);
     }
-    const int32_t hdr[5] = {0x31525452, layer, n_used, n_tok, call};
+    const int32_t hdr[5] = {0x31525452, layer, k, (int32_t) rows, call};
     fwrite(hdr, sizeof(hdr), 1, f);
-    for (int32_t i = 0; i < n_tok; ++i) {
-        fwrite(raw.data() + (size_t) i * t->nb[1], sizeof(int32_t), n_used, f);
+    for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
+            for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+                fwrite(raw.data() + i1 * t->nb[1] + i2 * t->nb[2] + i3 * t->nb[3], sizeof(int32_t), k, f);
+            }
+        }
     }
     fflush(f);
     return 1;
