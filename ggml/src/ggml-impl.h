@@ -125,6 +125,14 @@ static inline ggml_bf16_t ggml_compute_fp32_to_bf16(float s) {
 extern "C" {
 #endif
 
+// GGML_OP_PROF=<file> (research, default off): per-compute op timing records (ggml.c, ggml-backend.cpp).
+// ggml_op_prof_on() reads the env once; the writer is line-buffered in 1 MiB and flushed per scheduled graph.
+GGML_API int     ggml_op_prof_on(void);
+GGML_API int64_t ggml_op_prof_ns(void);      // CLOCK_MONOTONIC ns
+GGML_API int64_t ggml_op_prof_wall_ns(void); // CLOCK_REALTIME ns (to align with client timestamps)
+GGML_API void    ggml_op_prof_printf(const char * fmt, ...);
+GGML_API void    ggml_op_prof_flush(void);
+
 // static_assert should be a #define, but if it's not,
 // fall back to the _Static_assert C11 keyword.
 // if C99 - static_assert is noop
