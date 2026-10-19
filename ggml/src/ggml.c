@@ -29832,6 +29832,151 @@ static void ggml_cpu_stats_call(int64_t total_ns, int n_threads) {
     }
 }
 
+// GGML_OP_PROF=<file> (research, default off). Every CPU graph compute appends, from its calling thread:
+//   c <op>:<name without -<layer>> <count> <ns> [<rows> <experts>]   one line per node class; ns = wall time on thread 0 from
+//        the end of the previous node's barrier to the end of this node's (so it includes the node's load imbalance);
+//        MoE nodes (MUL_MAT_ID, MOE_FUSED_UP_GATE) add routed rows and distinct experts with id >= 0 (the CPU part)
+//   X <node name> <expert id>,...                                     distinct expert ids of each MoE up/gate node
+//   C <mono ns> <total ns> <fork ns> <join ns> <threads> <nodes>      the compute call (fork = call to thread 0 start)
+// ggml-backend.cpp adds A (graph split+alloc), S (one per split: copy-in, ahead launch, eval) and G/Y lines.
+#if !defined(_WIN32)
+static FILE * g_op_prof_fp;
+static atomic_int g_op_prof_state; // 0 unread, 1 off, 2 on
+static pthread_mutex_t g_op_prof_mu = PTHREAD_MUTEX_INITIALIZER;
+
+int ggml_op_prof_on(void) {
+    const int s = atomic_load_explicit(&g_op_prof_state, memory_order_acquire);
+    if (s) return s == 2;
+    pthread_mutex_lock(&g_op_prof_mu);
+    if (!atomic_load(&g_op_prof_state)) {
+        const char * path = getenv("GGML_OP_PROF");
+        g_op_prof_fp = path && *path ? fopen(path, "a") : NULL;
+        if (g_op_prof_fp) {
+            setvbuf(g_op_prof_fp, NULL, _IOFBF, 1 << 20);
+            fprintf(stderr, "ggml op prof: writing %s\n", path);
+        }
+        atomic_store_explicit(&g_op_prof_state, g_op_prof_fp ? 2 : 1, memory_order_release);
+    }
+    pthread_mutex_unlock(&g_op_prof_mu);
+    return atomic_load(&g_op_prof_state) == 2;
+}
+
+int64_t ggml_op_prof_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec*1000000000 + ts.tv_nsec;
+}
+
+int64_t ggml_op_prof_wall_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec*1000000000 + ts.tv_nsec;
+}
+
+void ggml_op_prof_printf(const char * fmt, ...) {
+    if (!ggml_op_prof_on()) return;
+    va_list ap;
+    va_start(ap, fmt);
+    pthread_mutex_lock(&g_op_prof_mu);
+    vfprintf(g_op_prof_fp, fmt, ap);
+    pthread_mutex_unlock(&g_op_prof_mu);
+    va_end(ap);
+}
+
+void ggml_op_prof_flush(void) {
+    if (!ggml_op_prof_on()) return;
+    pthread_mutex_lock(&g_op_prof_mu);
+    fflush(g_op_prof_fp);
+    pthread_mutex_unlock(&g_op_prof_mu);
+}
+#else
+int     ggml_op_prof_on(void) { return 0; }
+int64_t ggml_op_prof_ns(void) { return ggml_time_us()*1000; }
+int64_t ggml_op_prof_wall_ns(void) { return ggml_time_us()*1000; }
+void    ggml_op_prof_printf(const char * fmt, ...) { (void) fmt; }
+void    ggml_op_prof_flush(void) {}
+#endif
+
+#define GGML_OP_PROF_MAX_CLS 48
+#define GGML_OP_PROF_MAX_MOE 64
+struct ggml_op_prof_cls {
+    enum ggml_op op;
+    const char * name;
+    int len, n;
+    int64_t ns, rows, experts;
+};
+struct ggml_op_prof {
+    struct ggml_op_prof_cls cls[GGML_OP_PROF_MAX_CLS];
+    int n_cls, n_moe, n_nodes;
+    const struct ggml_tensor * moe[GGML_OP_PROF_MAX_MOE];
+    int moe_cls[GGML_OP_PROF_MAX_MOE];
+    int64_t t;
+};
+static int64_t g_op_prof_fork_ns, g_op_prof_end_ns; // written by thread 0 = the calling thread
+
+static int ggml_op_prof_name_len(const char * name) {
+    int n = (int) strlen(name), k = n;
+    while (k > 0 && name[k-1] >= '0' && name[k-1] <= '9') k--;
+    return k < n && k > 0 && name[k-1] == '-' ? k - 1 : n;
+}
+
+static void ggml_op_prof_add(struct ggml_op_prof * pr, const struct ggml_tensor * node) {
+    const int64_t t = ggml_op_prof_ns();
+    const int len = ggml_op_prof_name_len(node->name);
+    int i = 0;
+    for (; i < pr->n_cls; i++) {
+        const struct ggml_op_prof_cls * c = &pr->cls[i];
+        if (c->op == node->op && c->len == len && strncmp(c->name, node->name, len) == 0) break;
+    }
+    if (i == pr->n_cls) {
+        if (i == GGML_OP_PROF_MAX_CLS) i--; // overflow lands in the last class
+        else pr->cls[pr->n_cls++] = (struct ggml_op_prof_cls) { node->op, node->name, len, 0, 0, 0, 0 };
+    }
+    pr->cls[i].n++;
+    pr->cls[i].ns += t - pr->t;
+    pr->t = t;
+    pr->n_nodes++;
+    if ((node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MOE_FUSED_UP_GATE) && pr->n_moe < GGML_OP_PROF_MAX_MOE) {
+        pr->moe_cls[pr->n_moe] = i;
+        pr->moe[pr->n_moe++] = node;
+    }
+}
+
+static void ggml_op_prof_emit(struct ggml_op_prof * pr) {
+    for (int m = 0; m < pr->n_moe; m++) {
+        const struct ggml_tensor * node = pr->moe[m];
+        const struct ggml_tensor * ids = node->op == GGML_OP_MUL_MAT_ID ? node->src[2] : node->src[3];
+        const int n_as = (int) node->src[0]->ne[2];
+        if (!ids || !ids->data || ids->type != GGML_TYPE_I32 || n_as > 1024) continue;
+        uint64_t seen[16] = { 0 };
+        int64_t rows = 0, experts = 0;
+        for (int64_t r = 0; r < ids->ne[1]; r++) {
+            for (int64_t j = 0; j < ids->ne[0]; j++) {
+                const int32_t e = *(const int32_t *) ((const char *) ids->data + r*ids->nb[1] + j*ids->nb[0]);
+                if (e < 0 || e >= n_as) continue;
+                rows++;
+                if (!(seen[e >> 6] >> (e & 63) & 1)) { seen[e >> 6] |= 1ull << (e & 63); experts++; }
+            }
+        }
+        pr->cls[pr->moe_cls[m]].rows += rows;
+        pr->cls[pr->moe_cls[m]].experts += experts;
+        if (strstr(node->name, "down") == NULL) {
+            char buf[1024*6];
+            int o = snprintf(buf, sizeof(buf), "X %s", node->name);
+            char sep = ' ';
+            for (int e = 0; e < n_as && o < (int) sizeof(buf) - 8; e++) {
+                if (seen[e >> 6] >> (e & 63) & 1) { o += snprintf(buf + o, sizeof(buf) - o, "%c%d", sep, e); sep = ','; }
+            }
+            ggml_op_prof_printf("%s\n", buf);
+        }
+    }
+    for (int i = 0; i < pr->n_cls; i++) {
+        const struct ggml_op_prof_cls * c = &pr->cls[i];
+        ggml_op_prof_printf("c %s:%.*s %d %lld %lld %lld\n", ggml_op_name(c->op), c->len, c->name, c->n,
+                (long long) c->ns, (long long) c->rows, (long long) c->experts);
+    }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
 
@@ -29861,6 +30006,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     const struct ggml_cpu_knobs * knobs = &g_cpu_knobs;
     const size_t serial_small = params.nth > 1 ? knobs->serial_small : 0;
     const bool   stats = knobs->stats > 0 && state->ith == 0;
+    const bool   prof = state->ith == 0 && ggml_op_prof_on();
+    struct ggml_op_prof pr;
+    if (prof) {
+        pr.n_cls = pr.n_moe = pr.n_nodes = 0;
+        pr.t = ggml_op_prof_ns();
+        g_op_prof_fork_ns = pr.t - g_op_prof_fork_ns; // set to the call time by ggml_graph_compute
+    }
     int64_t st_barrier_ns = 0;
     int st_nodes = 0, st_barriers = 0, st_runs = 0, st_run_nodes = 0;
 
@@ -29929,12 +30081,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (knobs->fast_entry && node_n >= cgraph->n_nodes - 1) {
+            if (prof) ggml_op_prof_add(&pr, node); // thread 0's own end; the join line holds the rest
             break; // last node: the end of the parallel region (or the thread join) is the barrier
         }
 
         const int64_t tb = stats ? ggml_cpu_stats_ns() : 0;
         ggml_barrier(state->shared);
         if (stats) { st_barrier_ns += ggml_cpu_stats_ns() - tb; st_barriers++; }
+        if (prof) ggml_op_prof_add(&pr, node);
 
         if (state->shared->ec != GGML_STATUS_SUCCESS) {
             break;
@@ -29942,6 +30096,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     }
     if (stats) {
         ggml_cpu_stats_add(st_nodes, st_barriers, st_runs, st_run_nodes, st_barrier_ns);
+    }
+    if (prof) {
+        g_op_prof_end_ns = ggml_op_prof_ns();
+        ggml_op_prof_emit(&pr);
     }
 #if IK_PRINT_TIMING
     int64_t t_end = ggml_time_us();
@@ -29961,6 +30119,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     const struct ggml_cpu_knobs * knobs = ggml_get_cpu_knobs();
     const int64_t t_call = knobs->stats > 0 ? ggml_cpu_stats_ns() : 0;
     g_cpu_stats_fork_ns = t_call;
+    const bool prof = ggml_op_prof_on();
+    const int64_t t_prof = prof ? ggml_op_prof_ns() : 0;
+    g_op_prof_fork_ns = t_prof;
 
 #if defined(__gnu_linux__)
     // the calling thread is worker 0 and gets pinned below; remember its affinity
@@ -30057,6 +30218,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     if (knobs->stats > 0) {
         ggml_cpu_stats_call(ggml_cpu_stats_ns() - t_call, n_threads);
+    }
+    if (prof) {
+        const int64_t t_end = ggml_op_prof_ns();
+        ggml_op_prof_printf("C %lld %lld %lld %lld %d %d\n", (long long) t_prof, (long long) (t_end - t_prof),
+                (long long) g_op_prof_fork_ns, (long long) (t_end - g_op_prof_end_ns), n_threads, cgraph->n_nodes);
     }
 
 #if defined(__gnu_linux__)

@@ -2692,6 +2692,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     int ahead_split = -1;
     int ahead_n = 0;
 
+    // GGML_OP_PROF: S <split> <backend: c = CPU, d = device> <copy-in ns> <ahead launch ns> <eval ns> <nodes> <first node>
+    const bool prof = ggml_op_prof_on();
     for (int i = 0; i < sched->n_splits; i++) {
 #if IK_PRINT_TIMING
         int64_t tim1 = ggml_time_us();
@@ -2699,6 +2701,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[i];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const int64_t tp0 = prof ? ggml_op_prof_ns() : 0;
+        int64_t tp1 = 0, tp2 = 0;
 
         if (moe_prefetch && !moe_infos.empty()) {
             while (moe_next < moe_infos.size() && moe_infos[moe_next].split < i) {
@@ -2727,6 +2731,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (ggml_backend_is_cpu(split_backend)) {
             ggml_backend_sched_finish_h2d(sched);
         }
+        if (prof) tp1 = ggml_op_prof_ns();
 
         // ids are now final and host-visible; enqueue the selected expert
         // slices of this split's host-computed MoE matmuls (up/gate and down
@@ -2771,6 +2776,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (prof) tp2 = ggml_op_prof_ns();
         enum ggml_status ec = GGML_STATUS_SUCCESS;
         if (i == ahead_split) {
             // the head already ran ahead; compute the rest
@@ -2784,6 +2790,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
         if (ec != GGML_STATUS_SUCCESS) {
             return ec;
+        }
+        if (prof) {
+            ggml_op_prof_printf("S %d %c %lld %lld %lld %d %s\n", i, ggml_backend_is_cpu(split_backend) ? 'c' : 'd',
+                    (long long) (tp1 - tp0), (long long) (tp2 - tp1), (long long) (ggml_op_prof_ns() - tp2),
+                    split->graph.n_nodes, split->graph.n_nodes > 0 ? split->graph.nodes[0]->name : "-");
         }
 
         // the pages the lookahead streamer just read for this split are one-shot
@@ -3012,12 +3023,18 @@ static void ggml_sched_prepare_graph(ggml_backend_sched_t sched) {
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
 
+    const int64_t tp0 = ggml_op_prof_on() ? ggml_op_prof_ns() : 0;
     ggml_backend_sched_split_graph(sched, graph);
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
     }
     ggml_sched_prepare_graph(sched);
+    // GGML_OP_PROF: A <wall ns> <split+alloc ns> <graph nodes> <splits>
+    if (tp0) {
+        ggml_op_prof_printf("A %lld %lld %d %d\n", (long long) ggml_op_prof_wall_ns(), (long long) (ggml_op_prof_ns() - tp0),
+                graph->n_nodes, sched->n_splits);
+    }
 
     sched->is_alloc = true;
 
@@ -3047,12 +3064,27 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         ggml_hostcut_report(sched->n_splits, ggml_time_us() - t0);
         return st;
     }
+    if (ggml_op_prof_on()) {
+        // GGML_OP_PROF: G <wall ns at start> <mono ns at start> <compute_splits ns> <splits> <graph nodes>
+        const int64_t w0 = ggml_op_prof_wall_ns(), t0 = ggml_op_prof_ns();
+        const enum ggml_status st = ggml_backend_sched_compute_splits(sched);
+        ggml_op_prof_printf("G %lld %lld %lld %d %d\n", (long long) w0, (long long) t0, (long long) (ggml_op_prof_ns() - t0),
+                sched->n_splits, graph->n_nodes);
+        ggml_op_prof_flush();
+        return st;
+    }
     return ggml_backend_sched_compute_splits(sched);
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
+    const int64_t t0 = ggml_op_prof_on() ? ggml_op_prof_ns() : 0;
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
+    }
+    // GGML_OP_PROF: Y <wall ns at end> <synchronize ns>; the writer flushes here (once per scheduled graph)
+    if (t0) {
+        ggml_op_prof_printf("Y %lld %lld\n", (long long) ggml_op_prof_wall_ns(), (long long) (ggml_op_prof_ns() - t0));
+        ggml_op_prof_flush();
     }
 }
 
