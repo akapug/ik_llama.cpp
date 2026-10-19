@@ -4714,14 +4714,14 @@ static ggml_type ggml_type_from_str(const std::string & s) {
 // node of each MoE layer) as int32 records {0x31525452, layer, n_used, n_tokens, call} + n_used*n_tokens expert ids,
 // for expert-locality studies. <file>.off present = paused (checked every 200 ms). Only when no other eval callback is set;
 // the callback splits the graph at each ffn_moe_topk node, so timing under it is not the production speed.
-static bool route_dump_cb(struct ggml_tensor * t, bool ask, void * /*user_data*/) {
+static int route_dump_cb(struct ggml_tensor * t, bool ask, void * /*user_data*/) {
     static const char * path = getenv("LLAMA_ROUTE_DUMP");
     static FILE * f = path && *path ? fopen(path, "ab") : nullptr;
     static bool on = true;
     static int64_t last = 0;
     static int32_t call = 0, prev = INT32_MAX;
     if (!f || strncmp(t->name, "ffn_moe_topk-", 13) != 0 || t->type != GGML_TYPE_I32) {
-        return false;
+        return 0;
     }
     if (ask) {
         const int64_t now = ggml_time_us();
@@ -4729,7 +4729,7 @@ static bool route_dump_cb(struct ggml_tensor * t, bool ask, void * /*user_data*/
             last = now;
             on = access((std::string(path) + ".off").c_str(), F_OK) != 0;
         }
-        return on;
+        return on ? 1 : 0; // 1 = synchronize the backend before the observe call
     }
     const int32_t layer = atoi(t->name + 13), n_used = (int32_t) t->ne[0], n_tok = (int32_t) t->ne[1];
     if (layer <= prev) {
@@ -4749,7 +4749,7 @@ static bool route_dump_cb(struct ggml_tensor * t, bool ask, void * /*user_data*/
         fwrite(raw.data() + (size_t) i * t->nb[1], sizeof(int32_t), n_used, f);
     }
     fflush(f);
-    return true;
+    return 1;
 }
 
 struct llama_context_params common_context_params_to_llama(const gpt_params & params) {
