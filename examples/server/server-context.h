@@ -121,6 +121,9 @@ struct server_slot {
 
     llama_pos checkpoint_pos = -1;
     bool do_checkpoint = false;
+    // tokens before the prompt end where prompt processing stops for a checkpoint (request field
+    // "ctx_checkpoints_tolerance", default --ctx-checkpoints-tolerance; <= 0: one batch, checkpoint after the prompt)
+    int32_t ckpt_tolerance = 5;
     bool image_just_processed = false;
 
     // sampling

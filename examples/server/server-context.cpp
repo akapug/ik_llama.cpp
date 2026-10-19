@@ -1226,6 +1226,7 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     auto stream_opt = json_value(data, "stream_options", json::object());
     slot.params.include_usage = json_value(stream_opt, "include_usage", false);
     slot.params.cache_prompt = json_value(data, "cache_prompt", true);
+    slot.ckpt_tolerance = json_value(data, "ctx_checkpoints_tolerance", params_base.ctx_checkpoints_tolerance);
     slot.params.n_predict = json_value(data, "n_predict", json_value(data, "max_tokens", json_value(data, "max_completion_tokens", defaults.n_predict)));
     slot.saturate_predict = json_value(data, "saturate_predict", false);
     slot.sparams.top_k = json_value(data, "top_k", default_sparams.top_k);
@@ -4415,7 +4416,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     slot.n_past_prompt++;
                     slot.n_past++;
                     slot.image_just_processed = false;
-                    if (params_base.do_checkpoint && slot.n_prompt_tokens - slot.n_past_prompt == params_base.ctx_checkpoints_tolerance) {
+                    if (params_base.do_checkpoint && slot.n_prompt_tokens - slot.n_past_prompt == slot.ckpt_tolerance) {
                         slot.do_checkpoint = true;
                         break;
                     }
@@ -5128,7 +5129,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
                 metrics.on_prompt_eval(slot);
                 // create checkpoint after prompt processing ends
-                if (params_base.ctx_checkpoints_tolerance<=0 && params_base.do_checkpoint) {
+                if (slot.ckpt_tolerance<=0 && params_base.do_checkpoint) {
                     create_checkpoint(slot, true);
                 }
             }
