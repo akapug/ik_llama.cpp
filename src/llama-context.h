@@ -743,6 +743,14 @@ struct llama_context {
     std::unique_ptr<Prev> prev_mtp;
     int32_t mtp_step_idx = 0;
     int32_t mtp_n_heads = 0;
+    // reduced MTP draft head in use (1-based into model.draft_vocabs, 0 = full head); the MTP
+    // graph's logits then hold one column per kept token, expanded to n_vocab (-inf elsewhere)
+    // at the next llama_synchronize
+    int32_t mtp_draft_vocab = 0;
+    struct draft_rows_pending { float * dst; size_t off; const std::vector<int32_t> * ids; };
+    std::vector<float> draft_rows_buf;
+    std::vector<draft_rows_pending> draft_rows;
+    void expand_draft_rows();
 
     void reset_scheduler();
     bool can_reuse_graph(const llama_batch & u_batch, uint64_t seq_fingerprint, uint64_t model_state_hash);

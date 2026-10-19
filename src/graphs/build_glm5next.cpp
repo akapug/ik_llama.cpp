@@ -501,7 +501,7 @@ ggml_cgraph * llm_build_context::build_glm5next_mtp() {
             nullptr, LLM_NORM_RMS, cb, il);
     cb(cur, "result_norm", -1);
 
-    cur = build_output(lctx, ctx0, cur, model.output, nullptr, cb);
+    cur = build_output(lctx, ctx0, cur, mtp_draft_head(lctx, model.output), nullptr, cb);
     cb(cur, "result_output", -1);
     ggml_build_forward_expand(gf, cur);
     return gf;

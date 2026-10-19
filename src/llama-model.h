@@ -610,6 +610,18 @@ struct llama_model {
 
     std::unique_ptr<ggml_tensor> output_mtp_ptr;
 
+    // Reduced MTP draft heads (LLAMA_MTP_DRAFT_VOCAB): each holds the rows of the MTP head for a
+    // ranked token subset, so a draft token costs those rows only; the target still verifies with
+    // the full head. Selected per context with llama_set_mtp_draft_vocab (1-based, 0 = full head).
+    struct draft_vocab {
+        std::string spec;
+        std::vector<int32_t> ids;           // token id of each head row
+        std::unique_ptr<ggml_tensor> w;     // [n_embd, ids.size()], the source head's type
+        ggml_backend_buffer_t buf = nullptr;
+        ~draft_vocab() { if (buf) ggml_backend_buffer_free(buf); }
+    };
+    std::vector<std::unique_ptr<draft_vocab>> draft_vocabs;
+
     // Device-local DFlash IO copies for cross-buffer sharing.
     std::unique_ptr<ggml_tensor> dflash_tok_embd_ptr;
     std::unique_ptr<ggml_tensor> dflash_output_ptr;

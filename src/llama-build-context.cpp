@@ -2807,6 +2807,11 @@ std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_context::llm_buil
     return {Qcur, Kcur, Vcur};
 }
 
+ggml_tensor * llm_build_context::mtp_draft_head(const llama_context & lctx, ggml_tensor * full) {
+    const int32_t k = lctx.mtp_draft_vocab;
+    return k > 0 && k <= int32_t(lctx.model.draft_vocabs.size()) ? lctx.model.draft_vocabs[k - 1]->w.get() : full;
+}
+
 ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur,
         ggml_tensor * output, const llm_build_cb & cb) {
     // lm_head
