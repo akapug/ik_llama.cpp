@@ -121,6 +121,7 @@ struct numa_policy {
     std::string text;
     int mode = MPOL_BIND;
     std::vector<int> nodes;
+    std::vector<int> parts;   // "rows:A,B,..": the bind policies of each expert's equal row-byte slices, in order
     int min_node() const { return nodes.empty() ? k_max_nodes : *std::min_element(nodes.begin(), nodes.end()); }
     bool has(int node) const { return std::find(nodes.begin(), nodes.end(), node) != nodes.end(); }
 };
@@ -149,6 +150,17 @@ int policy_index(numa_plan & plan, const std::string & spec) {
     for (size_t i = 0; i < plan.policies.size(); ++i) if (plan.policies[i].text == spec) return (int) i;
     numa_policy p;
     p.text = spec;
+    if (spec.rfind("rows:", 0) == 0) {
+        // slice k of every expert's bytes (rows are contiguous inside an expert) binds to the k-th node, so a CPU thread
+        // group that owns a row range (GGML_MOE_GROUPS, one group per socket via an -cr list in socket order) reads
+        // only its own socket's memory
+        for (const auto & s : split(spec.substr(5), ',')) if (!s.empty()) p.parts.push_back(policy_index(plan, s));
+        if (p.parts.size() < 2) throw std::runtime_error("rows placement needs at least two nodes: " + spec);
+        for (int q : p.parts) p.nodes.push_back(plan.policies[q].nodes.front());
+        p.mode = -1;
+        plan.policies.push_back(p);
+        return (int) plan.policies.size() - 1;
+    }
     for (const auto & s : split(spec, ',')) {
         if (s.empty()) continue;
         const int node = std::stoi(s);
@@ -254,19 +266,25 @@ void llama_expert_numa_apply(const llama_model & model, bool use_mmap) {
             if (pol.front() >= 0) plan.unplaced += p0 - base;
             if (pol.back()  >= 0) plan.unplaced += end - p1;
 
-            // one policy per page: the expert that owns most of the page wins; ties go to the policy
-            // with the lowest node number (DRAM nodes come before CPU-less PMem nodes on this platform)
+            // the bind/interleave policy of one byte: its expert's policy, or for a rows policy the part its offset falls in
+            auto at = [&](uintptr_t a) {
+                const int e = (int) std::min<uintptr_t>((a - base) / nb2, n_exp - 1);
+                if (pol[e] < 0 || plan.policies[pol[e]].parts.empty()) return pol[e];
+                const auto & parts = plan.policies[pol[e]].parts;
+                return parts[std::min(parts.size() - 1, (size_t) ((a - base - (size_t) e * nb2) * parts.size() / nb2))];
+            };
+            // one policy per page: the owner of most of the page wins (a page holds at most one boundary, so the owners of
+            // the two middle bytes decide); ties go to the policy with the lowest node number (DRAM nodes come before
+            // CPU-less PMem nodes on this platform)
             auto page_policy = [&](uintptr_t p) {
-                const int e0 = (int) ((p - base) / nb2);
-                const int e1 = (int) std::min<uintptr_t>((p + page - 1 - base) / nb2, n_exp - 1);
-                if (e0 == e1 || pol[e0] == pol[e1]) return pol[e0];
+                const int a = at(p), b = at(p + page - 1);
+                if (a == b) return a;
                 ++plan.straddle_pages;
-                const size_t b0 = base + (size_t) (e0 + 1) * nb2 - p;
-                const size_t b1 = page - b0;
-                if (b0 != b1) return b0 > b1 ? pol[e0] : pol[e1];
-                if (pol[e0] < 0) return pol[e1];
-                if (pol[e1] < 0) return pol[e0];
-                return plan.policies[pol[e0]].min_node() <= plan.policies[pol[e1]].min_node() ? pol[e0] : pol[e1];
+                const int m0 = at(p + page / 2 - 1), m1 = at(p + page / 2);
+                if (m0 == m1) return m0;
+                if (m0 < 0) return m1;
+                if (m1 < 0) return m0;
+                return plan.policies[m0].min_node() <= plan.policies[m1].min_node() ? m0 : m1;
             };
 
             uintptr_t run = p0;
@@ -314,6 +332,7 @@ void llama_expert_numa_apply(const llama_model & model, bool use_mmap) {
     LLAMA_LOG_INFO("%s: %s: %zu expert tensors placed in %zu ranges (%zu skipped), %zu straddle pages, %.2f MiB left at tensor edges\n",
             __func__, path, n_tensors, plan.ranges.size(), n_skipped, plan.straddle_pages, plan.unplaced / 1048576.0);
     for (size_t i = 0; i < plan.policies.size(); ++i) {
+        if (!plan.policies[i].parts.empty()) continue;   // a rows policy's bytes are counted under its parts
         LLAMA_LOG_INFO("%s:   node(s) %-8s %s %10.1f MiB\n", __func__, plan.policies[i].text.c_str(),
                 plan.policies[i].mode == MPOL_BIND ? "bind      " : "interleave", plan.intended[i] / 1048576.0);
     }

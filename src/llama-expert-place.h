@@ -7,6 +7,9 @@
 //    (nb[2] bytes). The placement file binds slices to NUMA nodes with mbind(2) before
 //    the tensor data is read, so every page faults directly onto its target node
 //    (MPOL_MF_MOVE also migrates pages that are already present).
+//    Node field: "N" binds, "A,B" interleaves, "rows:A,B" binds slice k of the expert's bytes (its rows,
+//    in order) to the k-th node, so with GGML_MOE_GROUPS=2 and an -cr list in socket order each thread group
+//    reads only its own socket's memory.
 //
 // 2. Static GPU hot-expert set (env LLAMA_HOT_EXPERTS=/path.tsv):
 //    copies of the listed experts live in a per-layer bank on the GPU. For small
