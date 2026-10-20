@@ -53,7 +53,9 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ib32, 
 
 void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     uint a_offset, b_offset, d_offset;
-    get_offsets(a_offset, b_offset, d_offset);
+    if (!get_offsets(a_offset, b_offset, d_offset)) {
+        return;
+    }
 
     const uint num_blocks_per_row = p.ncols / QUANT_K;
 

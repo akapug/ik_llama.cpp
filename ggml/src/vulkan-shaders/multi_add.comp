@@ -30,8 +30,8 @@ void main() {
     uint i1 = i / p.ne0;
     uint i0 = i % p.ne0;
 
-    float sum = data_a[i1*p.nb01 + i0] + data_a[i1*p.nb01 + i0 + p.ne0];
-    for (int j = 2; j < p.nadd; ++j) sum += data_a[i1*p.nb01 + i0 + j*p.ne0];
+    float sum = 0.0f;
+    for (uint j = 0; j < p.nadd; ++j) sum += data_a[i1*p.nb01 + i0 + j*p.ne0];
 
     data_d[i1*p.nb1 + i0] = D_TYPE(sum);
 }
