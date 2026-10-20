@@ -2497,6 +2497,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.use_mmap = false;
         return true;
     }
+    if (arg == "--no-host") {
+        setenv("LLAMA_NO_HOST_WEIGHTS", "1", 1);   // read once by llama_no_host_weights() at model load
+        return true;
+    }
     if (arg == "-rtr" || arg == "--run-time-repack") {
         params.repack_tensors = true;
         params.use_mmap = false;
@@ -3603,6 +3607,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     }
     if (llama_supports_mmap()) {
         options.push_back({ "*",       "-nmm,   --no-mmap",               "do not memory-map model (slower load but may reduce pageouts if not using mlock)" });
+        options.push_back({ "*",       "        --no-host",               "CPU-side weights in plain CPU memory, never pinned (env LLAMA_NO_HOST_WEIGHTS=1)" });
     }
     options.push_back({ "*",           "-rtr,   --run-time-repack",      "repack tensors if interleaved variant is available"});
     options.push_back({ "*",           "-cmoe,  --cpu-moe",              "keep all MoE weights in CPU memory"});
