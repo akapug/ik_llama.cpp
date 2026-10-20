@@ -15,7 +15,7 @@ DEFAULT_MEMORY = "16g"
 DEFAULT_WALL_SECONDS = 7200
 DEFAULT_ESTIMATE_GIB = "32"
 SCRIPT_INPUTS = ("scripts/hl332-build.sh", "scripts/hl332-container.sh", "scripts/hl332-launch.py")
-ARTIFACTS = ("result.txt", "source-tree.txt", "source-commit.txt", "toolchain.txt", "image-digests.json", "cpu-controls.log", "cpu-build.log", "cpu-configure.log", "mixed-configure.log", "mixed-build.log", "container.log", "absent-backend.log", "zero-cases.log", "link-closure.txt", "package-sha256.txt")
+ARTIFACTS = ("evidence",)
 
 
 def digest(data):

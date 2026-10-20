@@ -18,7 +18,10 @@ cores=${FAB_JOBS:?Fab must declare the admitted CPU allocation}
 (( cores <= cores_max ))
 out="$PWD/hl332-result"
 # Create-only: a failed or earlier run is evidence, never overwritten or deleted.
-mkdir "$out"
+mkdir "$out" "$out/evidence"
+# Deliver existing bounded evidence even on early failure, without requiring logs
+# from stages that were never reached. Build trees and binary payloads stay remote.
+trap 'rc=$?; if (( rc )); then printf "BUILD_FAILED exit=%s\\n" "$rc" > "$out/result.txt"; fi; find "$out" -maxdepth 1 -type f -exec cp -- {} "$out/evidence/" \;' EXIT
 printf '%s\n' "$expected_tree" > "$out/source-tree.txt"
 printf '%s\n' "$expected_commit" > "$out/source-commit.txt"
 printf '%s\n' "$image" > "$out/image-request.txt"
