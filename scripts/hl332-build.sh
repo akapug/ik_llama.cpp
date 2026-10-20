@@ -13,7 +13,7 @@ wall_seconds=$7
 [ -z "$(git status --porcelain --untracked-files=all)" ]
 [[ $key =~ ^hl332-[0-9a-f]{12}$ ]]
 [[ $cores_max =~ ^[1-9][0-9]*$ && $wall_seconds =~ ^[1-9][0-9]*$ ]]
-cores=${FAB_CORES:?Fab must declare the admitted CPU allocation}
+cores=${FAB_JOBS:?Fab must declare the admitted CPU allocation}
 [[ $cores =~ ^[1-9][0-9]*$ ]]
 (( cores <= cores_max ))
 out="$PWD/hl332-result"
