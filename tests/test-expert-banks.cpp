@@ -25,7 +25,9 @@ struct memory_device {
         guid[0] = identity;
         buft.context = this;
         buft.iface.get_name = [](ggml_backend_buffer_type_t) { return "synthetic-device-storage"; };
-        buft.iface.get_alignment = [](ggml_backend_buffer_type_t) -> size_t { return 64; };
+        buft.iface.get_alignment = [](ggml_backend_buffer_type_t) -> size_t {
+            return ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
+        };
         buft.iface.get_max_size = [](ggml_backend_buffer_type_t) -> size_t { return SIZE_MAX; };
         buft.iface.is_host = [](ggml_backend_buffer_type_t) { return false; };
         buft.iface.alloc_buffer = [](ggml_backend_buffer_type_t bt, size_t size) {
