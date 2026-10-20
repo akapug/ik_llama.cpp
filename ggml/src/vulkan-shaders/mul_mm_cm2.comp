@@ -155,6 +155,21 @@ void main() {
     const uint ir = gl_WorkGroupID.x % blocks_m;
     const uint ik = gl_WorkGroupID.x / blocks_m;
     const uint ic = gl_WorkGroupID.y;
+#ifdef MUL_MAT_ID
+    if (expert_idx == 0 && ic == 0) {
+        for (uint t = 0; t < p.nei1; ++t) {
+            for (uint e = 0; e < p.nei0; ++e) {
+                if (data_ids[t * p.nbi1 + e] < 0) {
+                    for (uint r = tid; r < BM; r += gl_WorkGroupSize.x) {
+                        if (ir * BM + r < p.M) {
+                            data_d[t * p.batch_stride_d + e * p.stride_d + ir * BM + r] = D_TYPE(0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
 
 #ifdef MUL_MAT_ID
     // Spread the search across all elements in the first subgroup
@@ -209,10 +224,10 @@ void main() {
 #endif
 
 #ifdef MUL_MAT_ID
-    uint pos_a = (expert_idx * p.batch_stride_a) / QUANT_K;
+    uint pos_a = expert_idx * (p.batch_stride_a / QUANT_K);
     uint pos_b = 0;
 #else
-    uint pos_a = (batch_idx_a * p.batch_stride_a) / QUANT_K;
+    uint pos_a = batch_idx_a * (p.batch_stride_a / QUANT_K);
     uint pos_b = batch_idx * p.batch_stride_b;
     uint pos_d = batch_idx * p.batch_stride_d + ik * p.batch_stride_d * gl_NumWorkGroups.z;
 #endif

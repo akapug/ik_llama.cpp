@@ -20,5 +20,9 @@ void main() {
 
     const float xi = float(data_a[i]);
     const float yi = float(data_b[i]);
-    data_d[i] = D_TYPE(xi * yi / (1.0f + exp(-xi)));
+    // Fork contract: activate the gate first, then cap it and clamp the up value.
+    const float gate = xi / (1.0f + exp(-xi));
+    data_d[i] = D_TYPE(p.param1 >= 1e-6f
+        ? min(gate, p.param1) * clamp(yi, -p.param1, p.param1)
+        : gate * yi);
 }

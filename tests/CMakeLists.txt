@@ -193,6 +193,13 @@ llama_build_and_test(test-chat-template.cpp )
 llama_build_and_test(test-json-partial.cpp )
 llama_build_and_test(test-cpu-affinity.cpp )
 
+# Explicit backend controls; device profiles are never registered as automatic CTests.
+find_package(Threads REQUIRED)
+add_executable(test-backend-ops test-backend-ops.cpp)
+target_link_libraries(test-backend-ops PRIVATE ggml Threads::Threads)
+add_test(NAME test-backend-moe-cpu COMMAND $<TARGET_FILE:test-backend-ops> --hl332-cpu)
+set_property(TEST test-backend-moe-cpu PROPERTY LABELS main)
+
 # header-only pinned-memory budget of the CUDA backend; needs no GPU, so it builds in every configuration
 find_package(Threads REQUIRED)
 add_executable(test-cuda-pin-budget test-cuda-pin-budget.cpp)

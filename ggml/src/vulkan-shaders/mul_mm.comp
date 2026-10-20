@@ -141,6 +141,24 @@ void main() {
     const uint ik = gl_WorkGroupID.x / blocks_m;
     const uint ic = gl_WorkGroupID.y;
 
+#ifdef MUL_MAT_ID
+    // Only expert zero / column tile zero owns inactive slots. Active slots
+    // have different addresses, so this needs no cross-workgroup barrier.
+    if (expert_idx == 0 && ic == 0) {
+        for (uint t = 0; t < p.nei1; ++t) {
+            for (uint e = 0; e < p.nei0; ++e) {
+                if (data_ids[t * p.nbi1 + e] < 0) {
+                    for (uint r = gl_LocalInvocationID.x; r < BM; r += BLOCK_SIZE) {
+                        if (ir * BM + r < p.M) {
+                            data_d[t * p.batch_stride_d + e * p.stride_d + ir * BM + r] = D_TYPE(0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
+
     const uint WNITER = (WM * WN) / (WARP * TM * TN * WMITER);
     const uint WSUBM = WM / WMITER;
     const uint WSUBN = WN / WNITER;
@@ -242,13 +260,15 @@ void main() {
     const uint end_k = min(p.K, (ik + 1) * p.k_split);
 #endif
 
+    // Divide the per-expert stride before multiplying: a V4.1 bank can
+    // exceed UINT32_MAX elements while its vector-load indices still fit.
     uint pos_a = (
 #ifdef MUL_MAT_ID
-        expert_idx * p.batch_stride_a +
+        expert_idx * (p.batch_stride_a / LOAD_VEC_A) +
 #else
-        batch_idx_a * p.batch_stride_a +
+        batch_idx_a * (p.batch_stride_a / LOAD_VEC_A) +
 #endif
-        ir * BM * p.stride_a + start_k) / LOAD_VEC_A;
+        (ir * BM * p.stride_a + start_k) / LOAD_VEC_A);
 #ifdef MUL_MAT_ID
     uint pos_b = 0;
 #else
@@ -747,6 +767,18 @@ void main() {
             buf_a[buf_idx + 1 ] = FLOAT_TYPE(kvalues_iq4nl[bitfieldExtract(vui, 8, 4)]) * d;
             buf_a[buf_idx + 16] = FLOAT_TYPE(kvalues_iq4nl[bitfieldExtract(vui, 4, 4)]) * d;
             buf_a[buf_idx + 17] = FLOAT_TYPE(kvalues_iq4nl[vui >> 12]) * d;
+#elif defined(DATA_A_MXFP4)
+            const uint idx = pos_a + (loadc_a + l) * p.stride_a / LOAD_VEC_A + loadr_a;
+            const uint buf_idx = (loadc_a + l) * SHMEM_STRIDE + 2 * loadr_a;
+            const uint ib = idx / 8;
+            const uint iqs = (idx & 0x07) * 2;
+            const float d = e8m0_to_fp32(data_a[ib].e);
+            const uint vui = uint(data_a[ib].qs[iqs]);
+            const uint vui2 = uint(data_a[ib].qs[iqs + 1]);
+            buf_a[buf_idx     ] = FLOAT_TYPE(kvalues_mxfp4[vui & 0xF] * d);
+            buf_a[buf_idx + 16] = FLOAT_TYPE(kvalues_mxfp4[vui >> 4] * d);
+            buf_a[buf_idx +  1] = FLOAT_TYPE(kvalues_mxfp4[vui2 & 0xF] * d);
+            buf_a[buf_idx + 17] = FLOAT_TYPE(kvalues_mxfp4[vui2 >> 4] * d);
 #elif defined(DATA_A_IQ4_KS)
             const uint idx = pos_a + (loadc_a + l) * p.stride_a / LOAD_VEC_A + loadr_a;
             const uint buf_idx = (loadc_a + l) * SHMEM_STRIDE + loadr_a * LOAD_VEC_A;
