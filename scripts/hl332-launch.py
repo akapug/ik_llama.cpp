@@ -50,7 +50,8 @@ def bind(args):
     # replacement grammar. Only this parser slice runs; no placement/probe code.
     start = native.index("declare -A GATE_OPTIONS=(")
     stop = native.index("\nCMD=(", start)
-    parser = native[start:stop]
+    initialization = next(line for line in native[:start].splitlines() if line.startswith("COMPILER_USE_DECLARED=auto;"))
+    parser = initialization + "\n" + native[start:stop]
     argv = ["fab", "build", "--repo", str(repo), "--tree", tree, "--key", key,
             "--cores-max", str(args.cores), "--compiler-use", "none"]
     for name in ARTIFACTS:
