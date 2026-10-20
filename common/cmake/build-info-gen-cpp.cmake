@@ -1,7 +1,9 @@
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
 
 set(TEMPLATE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/common/build-info.cpp.in")
-set(OUTPUT_FILE   "${CMAKE_CURRENT_SOURCE_DIR}/common/build-info.cpp")
+if(NOT DEFINED OUTPUT_FILE)
+    message(FATAL_ERROR "OUTPUT_FILE must name the generated build-directory source")
+endif()
 
 # Only write the build info if it changed
 if(EXISTS ${OUTPUT_FILE})

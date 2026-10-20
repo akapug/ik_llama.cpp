@@ -18,5 +18,9 @@ void main() {
     }
 
     const float xi = float(data_a[i]);
+#ifdef SQRT_SOFTPLUS
+    data_d[i] = D_TYPE(sqrt(xi > 20.0f ? xi : log(1.0f + exp(xi))));
+#else
     data_d[i] = D_TYPE(xi / (1.0f + exp(-xi)));
+#endif
 }

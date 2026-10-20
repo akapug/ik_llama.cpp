@@ -85,8 +85,14 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     const uint tid = gl_LocalInvocationID.x;
 
-    get_offsets(a_offset, b_offset, d_offset);
+    if (!get_offsets(a_offset, b_offset, d_offset)) {
+        return;
+    }
     a_offset /= QUANT_K;
+#if defined(MUL_MAT_ID) && (defined(DATA_A_MXFP4) || defined(DATA_A_Q8_0))
+    // A full V4.1 bank exceeds UINT32_MAX logical elements, but not blocks.
+    a_offset = uint(data_ids[gl_GlobalInvocationID.y]) * (p.batch_stride_a / QUANT_K);
+#endif
 
     y_offset = QUANT_R == 1 ? 1 : QUANT_K/2;
 
