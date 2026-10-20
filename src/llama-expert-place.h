@@ -10,6 +10,11 @@
 //    Node field: "N" binds, "A,B" interleaves, "rows:A,B" binds slice k of the expert's bytes (its rows,
 //    in order) to the k-th node, so with GGML_MOE_GROUPS=2 and an -cr list in socket order each thread group
 //    reads only its own socket's memory.
+//    Rule keys: a layer ("blk.N"), an exact tensor name, or "re:<regex>" searched in tensor names. A name or regex rule
+//    also reaches non-expert host weights (attention, dense FFN, shared experts, output head); for those the experts
+//    field is "*" (one block) or "/G" (G equal consecutive blocks, each split by a rows policy: a grouped weight such as
+//    the DeepSeek-V4 attn_output_a). With -cr in node order, the static row split of a dense matmul then gives node k's
+//    threads slice k of every block.
 //
 // 2. Static GPU hot-expert set (env LLAMA_HOT_EXPERTS=/path.tsv):
 //    copies of the listed experts live in a per-layer bank on the GPU. For small

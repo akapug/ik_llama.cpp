@@ -13,10 +13,13 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <memory>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #ifdef __linux__
 #include <sys/syscall.h>
@@ -211,7 +214,9 @@ void llama_expert_numa_apply(const llama_model & model, bool use_mmap) {
 #endif
     const bool strict = getenv("LLAMA_EXPERT_PLACEMENT_STRICT") && atoi(getenv("LLAMA_EXPERT_PLACEMENT_STRICT"));
 
-    struct rule { std::string key; int layer; std::string experts; int policy; int line; };
+    // a key is a layer ("blk.N" / "N"), an exact tensor name, or "re:<ECMAScript regex>" searched in tensor names
+    struct rule { std::string key; int layer; std::string experts; int policy; int line; std::shared_ptr<std::regex> re; };
+    auto names = [](const rule & r, const char * name) { return r.re ? std::regex_search(name, *r.re) : r.key == name; };
     std::vector<rule> rules;
     std::string line;
     for (int ln = 1; std::getline(in, line); ++ln) {
@@ -223,19 +228,71 @@ void llama_expert_numa_apply(const llama_model & model, bool use_mmap) {
         std::stringstream ss(line);
         for (std::string w; ss >> w;) f.push_back(w);
         if (f.size() != 3) throw std::runtime_error(std::string(path) + ":" + std::to_string(ln) + ": expected 3 fields (tensor-or-layer, experts, node)");
-        rules.push_back({ f[0], parse_layer_key(f[0]), f[1], policy_index(plan, f[2]), ln });
+        auto re = f[0].rfind("re:", 0) == 0 ? std::make_shared<std::regex>(f[0].substr(3)) : nullptr;
+        rules.push_back({ f[0], re ? -1 : parse_layer_key(f[0]), f[1], policy_index(plan, f[2]), ln, re });
     }
     plan.intended.assign(plan.policies.size(), 0);
 
     const size_t page = plan.page;
     const unsigned long maxnode = k_max_nodes;
+    // bind one tensor: pol[i] = policy of its i-th block of nb2 bytes (an expert, or a group of a grouped dense weight);
+    // a rows policy splits each block's bytes in order over its nodes
+    auto place = [&](ggml_tensor * t, const std::vector<int> & pol, size_t nb2) {
+        const int n_exp = (int) pol.size();
+        const uintptr_t base = (uintptr_t) t->data;
+        const uintptr_t end  = base + ggml_nbytes(t);
+        const uintptr_t p0   = (base + page - 1) / page * page;   // round inward at the tensor edges:
+        const uintptr_t p1   = end / page * page;                 // edge pages may hold other tensors
+        if (pol.front() >= 0) plan.unplaced += p0 - base;
+        if (pol.back()  >= 0) plan.unplaced += end - p1;
+
+        // the bind/interleave policy of one byte: its expert's policy, or for a rows policy the part its offset falls in
+        auto at = [&](uintptr_t a) {
+            const int e = (int) std::min<uintptr_t>((a - base) / nb2, n_exp - 1);
+            if (pol[e] < 0 || plan.policies[pol[e]].parts.empty()) return pol[e];
+            const auto & parts = plan.policies[pol[e]].parts;
+            return parts[std::min(parts.size() - 1, (size_t) ((a - base - (size_t) e * nb2) * parts.size() / nb2))];
+        };
+        // one policy per page: the owner of most of the page wins (a page holds at most one boundary, so the owners of
+        // the two middle bytes decide); ties go to the policy with the lowest node number (DRAM nodes come before
+        // CPU-less PMem nodes on this platform)
+        auto page_policy = [&](uintptr_t p) {
+            const int a = at(p), b = at(p + page - 1);
+            if (a == b) return a;
+            ++plan.straddle_pages;
+            const int m0 = at(p + page / 2 - 1), m1 = at(p + page / 2);
+            if (m0 == m1) return m0;
+            if (m0 < 0) return m1;
+            if (m1 < 0) return m0;
+            return plan.policies[m0].min_node() <= plan.policies[m1].min_node() ? m0 : m1;
+        };
+
+        uintptr_t run = p0;
+        int run_pol = p0 < p1 ? page_policy(p0) : -1;
+        auto flush = [&](uintptr_t stop) {
+            if (run_pol < 0 || stop <= run) return;
+            plan.ranges.push_back({ (char *) run, (size_t) (stop - run), run_pol });
+        };
+        for (uintptr_t p = p0 + page; p < p1; p += page) {
+            const int pp = page_policy(p);
+            if (pp != run_pol) {
+                flush(p);
+                run = p;
+                run_pol = pp;
+            }
+        }
+        flush(p1);
+    };
+
     size_t n_tensors = 0, n_skipped = 0;
+    std::unordered_set<const ggml_tensor *> seen;   // expert tensors: placed by the loop below or left alone
     for (size_t il = 0; il < model.layers.size(); ++il) {
         for (const auto & lt : layer_expert_tensors(model.layers[il])) {
             ggml_tensor * t = lt.t;
+            seen.insert(t);
             std::vector<const rule *> mine;
             for (const auto & r : rules) {
-                if (r.layer == (int) il || (r.layer < 0 && r.key == t->name)) mine.push_back(&r);
+                if (r.layer == (int) il || (r.layer < 0 && names(r, t->name))) mine.push_back(&r);
             }
             if (mine.empty()) continue;
             if (!is_host_weight(t) || !expert_contiguous(t)) {
@@ -258,51 +315,30 @@ void llama_expert_numa_apply(const llama_model & model, bool use_mmap) {
             }
             if (std::all_of(pol.begin(), pol.end(), [](int p) { return p < 0; })) continue;
             ++n_tensors;
-
-            const uintptr_t base = (uintptr_t) t->data;
-            const uintptr_t end  = base + ggml_nbytes(t);
-            const uintptr_t p0   = (base + page - 1) / page * page;   // round inward at the tensor edges:
-            const uintptr_t p1   = end / page * page;                 // edge pages may hold other tensors
-            if (pol.front() >= 0) plan.unplaced += p0 - base;
-            if (pol.back()  >= 0) plan.unplaced += end - p1;
-
-            // the bind/interleave policy of one byte: its expert's policy, or for a rows policy the part its offset falls in
-            auto at = [&](uintptr_t a) {
-                const int e = (int) std::min<uintptr_t>((a - base) / nb2, n_exp - 1);
-                if (pol[e] < 0 || plan.policies[pol[e]].parts.empty()) return pol[e];
-                const auto & parts = plan.policies[pol[e]].parts;
-                return parts[std::min(parts.size() - 1, (size_t) ((a - base - (size_t) e * nb2) * parts.size() / nb2))];
-            };
-            // one policy per page: the owner of most of the page wins (a page holds at most one boundary, so the owners of
-            // the two middle bytes decide); ties go to the policy with the lowest node number (DRAM nodes come before
-            // CPU-less PMem nodes on this platform)
-            auto page_policy = [&](uintptr_t p) {
-                const int a = at(p), b = at(p + page - 1);
-                if (a == b) return a;
-                ++plan.straddle_pages;
-                const int m0 = at(p + page / 2 - 1), m1 = at(p + page / 2);
-                if (m0 == m1) return m0;
-                if (m0 < 0) return m1;
-                if (m1 < 0) return m0;
-                return plan.policies[m0].min_node() <= plan.policies[m1].min_node() ? m0 : m1;
-            };
-
-            uintptr_t run = p0;
-            int run_pol = p0 < p1 ? page_policy(p0) : -1;
-            auto flush = [&](uintptr_t stop) {
-                if (run_pol < 0 || stop <= run) return;
-                plan.ranges.push_back({ (char *) run, (size_t) (stop - run), run_pol });
-            };
-            for (uintptr_t p = p0 + page; p < p1; p += page) {
-                const int pp = page_policy(p);
-                if (pp != run_pol) {
-                    flush(p);
-                    run = p;
-                    run_pol = pp;
-                }
-            }
-            flush(p1);
+            place(t, pol, nb2);
         }
+    }
+
+    // any other host weight a name or regex rule matches (attention, dense FFN, shared experts, output head): the experts
+    // field is "*" (the tensor is one block) or "/G" (G equal consecutive blocks, e.g. the DeepSeek-V4 grouped
+    // attn_output_a, whose grouped matmul gives each group's rows to every node's threads); with -cr in node order and the
+    // static row split of a dense matmul, node k's threads then read slice k of every block
+    size_t n_dense = 0;
+    for (const auto & [name, t] : model.tensors_by_name) {
+        if (seen.count(t)) continue;
+        const rule * r = nullptr;
+        for (const auto & x : rules) if (x.layer < 0 && names(x, name.c_str())) r = &x;   // the last matching rule wins
+        if (!r) continue;
+        if (!is_host_weight(t) || !ggml_is_contiguous(t)) {
+            ++n_skipped;
+            LLAMA_LOG_WARN("%s: %s is not a contiguous host weight; skipped\n", __func__, name.c_str());
+            continue;
+        }
+        const std::string where = std::string(path) + ":" + std::to_string(r->line);
+        const int g = r->experts == "*" ? 1 : r->experts.rfind("/", 0) == 0 ? std::stoi(r->experts.substr(1)) : 0;
+        if (g < 1 || ggml_nbytes(t) % g) throw std::runtime_error(where + ": a non-expert tensor takes \"*\" or \"/G\" (G dividing its bytes): " + name);
+        ++n_dense;
+        place(t, std::vector<int>(g, r->policy), ggml_nbytes(t) / g);
     }
 
     // bind (and migrate, for pages already faulted in) the policy with the highest node first: on this platform the
@@ -329,8 +365,8 @@ void llama_expert_numa_apply(const llama_model & model, bool use_mmap) {
     }
     plan.ranges = std::move(placed);
 
-    LLAMA_LOG_INFO("%s: %s: %zu expert tensors placed in %zu ranges (%zu skipped), %zu straddle pages, %.2f MiB left at tensor edges\n",
-            __func__, path, n_tensors, plan.ranges.size(), n_skipped, plan.straddle_pages, plan.unplaced / 1048576.0);
+    LLAMA_LOG_INFO("%s: %s: %zu expert + %zu other tensors placed in %zu ranges (%zu skipped), %zu straddle pages, %.2f MiB left at tensor edges\n",
+            __func__, path, n_tensors, n_dense, plan.ranges.size(), n_skipped, plan.straddle_pages, plan.unplaced / 1048576.0);
     for (size_t i = 0; i < plan.policies.size(); ++i) {
         if (!plan.policies[i].parts.empty()) continue;   // a rows policy's bytes are counted under its parts
         LLAMA_LOG_INFO("%s:   node(s) %-8s %s %10.1f MiB\n", __func__, plan.policies[i].text.c_str(),
