@@ -1802,6 +1802,27 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
         }
     }
 
+    // pass 4b: an inplace op (a compute op whose result is a view of view_src) runs on the backend that owns its memory.
+    // If a user assignment (the llama graph callback pins layer nodes to the layer's device) puts it elsewhere while
+    // view_src lives on another backend, e.g. DeepSeek V4's inverse rope on CUDA after a flash attention that sm_61 can
+    // only run on the CPU, then the next split copies that tensor in BEFORE the inplace op writes it and consumers read
+    // stale data (V4.1 on a GTX 1080 Ti: wo_a sum 15.4 vs 49.2, all text garbage). GGML_SCHED_INPLACE_FOLLOW=0 disables.
+    {
+        static const bool follow = [] { const char * e = getenv("GGML_SCHED_INPLACE_FOLLOW"); return !e || atoi(e) != 0; }();
+        for (int i = 0; follow && i < graph->n_nodes; i++) {
+            struct ggml_tensor * node = graph->nodes[i];
+            if (node->view_src == NULL || ggml_is_view_op(node->op)) {
+                continue;
+            }
+            int * node_id = &tensor_backend_id(node);
+            const int src_id = tensor_backend_id(node->view_src);
+            if (src_id != -1 && *node_id != src_id && ggml_backend_supports_op(sched->backends[src_id], node)) {
+                *node_id = src_id;
+                SET_CAUSE(node, "4b.inpl");
+            }
+        }
+    }
+
     // pass 5: split graph, find tensors that need to be copied
     {
         int i_split = 0;
