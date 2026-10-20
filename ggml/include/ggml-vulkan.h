@@ -16,6 +16,10 @@ extern "C" {
 GGML_API GGML_CALL ggml_backend_t ggml_backend_vk_init(size_t dev_num);
 
 GGML_API GGML_CALL bool ggml_backend_is_vk(ggml_backend_t backend);
+// Read capabilities of an already admitted backend; never select/enumerate devices.
+// Allocation is the current allocator cap (including its device allocation cap).
+GGML_API GGML_CALL bool ggml_backend_vk_get_bank_limits(ggml_backend_t backend,
+        size_t * allocation, size_t * descriptor, size_t * alignment);
 GGML_API GGML_CALL int  ggml_backend_vk_get_device_count(void);
 GGML_API GGML_CALL void ggml_backend_vk_get_device_description(int device, char * description, size_t description_size);
 GGML_API GGML_CALL void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total);

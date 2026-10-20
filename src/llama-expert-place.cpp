@@ -658,9 +658,15 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
         int device = -1;
         if (!want.empty()) {
             bool ok = true;
-            for (const auto & s : sources) {
+            for (auto & s : sources) {
+                for (int e : want) if (s.local[e] >= 0) s.banked.push_back(e);
+                if (s.banked.empty()) continue;
                 for (const ggml_tensor * t : part_tensors(s.w)) {
-                    ok = ok && is_host_weight(t) && t->ne[3] == 1 && (size_t) t->nb[2] * (size_t) t->ne[2] == ggml_nbytes(t);
+                    if (!is_host_weight(t)) {
+                        throw std::runtime_error("hot experts: requested global expert " + std::to_string(s.banked.front()) +
+                                " is already device-resident in " + t->name);
+                    }
+                    ok = ok && t->ne[3] == 1 && (size_t) t->nb[2] * (size_t) t->ne[2] == ggml_nbytes(t);
                 }
             }
             if (il < model.default_layer_device.size() && model.default_layer_device[il] >= 0) {
@@ -677,6 +683,7 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
                 throw std::runtime_error("hot experts: no GPU backend");
             } else {
                 for (const auto & s : sources) {
+                    if (s.banked.empty()) continue;
                     for (const ggml_tensor * t : part_tensors(s.w)) {
                         if (want.empty() || bank_type(device, t) != GGML_TYPE_COUNT) continue;
                         LLAMA_LOG_WARN("llama_hot_experts: layer %zu: %s is %s, which %s cannot run; no GPU bank\n",
@@ -684,9 +691,6 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
                         want.clear();
                     }
                 }
-            }
-            for (int e : want) {
-                for (auto & s : sources) if (s.local[e] >= 0) s.banked.push_back(e);
             }
         }
 

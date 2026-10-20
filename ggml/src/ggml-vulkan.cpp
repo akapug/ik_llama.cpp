@@ -2954,6 +2954,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_ ## name [1], #name "_f16", name ## _f16_len, name ## _f16_data, "main", 2, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
     CREATE_UNARY(gelu)
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_I32], "get_rows_i32", get_rows_i32_len, get_rows_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
+
     CREATE_UNARY(gelu_erf)
     CREATE_UNARY(gelu_quick)
     CREATE_UNARY(silu)
@@ -6635,6 +6637,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         if (dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_get_rows_f32[src0->type];
+        }
+        if (src0->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32) {
+            return ctx->device->pipeline_get_rows[GGML_TYPE_I32];
         }
         return nullptr;
     case GGML_OP_ACC:
@@ -10737,6 +10742,9 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
             }
         case GGML_OP_GET_ROWS:
             {
+                if (op->src[0]->type == GGML_TYPE_I32) {
+                    return op->src[1]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_I32;
+                }
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
@@ -10964,6 +10972,17 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
 
 bool ggml_backend_is_vk(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_vk_guid());
+}
+
+bool ggml_backend_vk_get_bank_limits(ggml_backend_t backend, size_t * allocation, size_t * descriptor, size_t * alignment) {
+    if (!ggml_backend_is_vk(backend) || !allocation || !descriptor || !alignment) {
+        return false; // UNKNOWN: no admitted Vulkan context or invalid destinations
+    }
+    const auto * ctx = (const ggml_backend_vk_context *) backend->context;
+    *allocation = std::min(ctx->device->suballocation_block_size, ctx->device->max_memory_allocation_size);
+    *descriptor = ctx->device->properties.limits.maxStorageBufferRange;
+    *alignment = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    return *allocation && *descriptor && *alignment;
 }
 
 int ggml_backend_vk_get_device_count() {
