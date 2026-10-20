@@ -2092,7 +2092,7 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
         GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
         GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
         GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
-        GGML_TYPE_Q8_0,
+        GGML_TYPE_Q8_0, GGML_TYPE_MXFP4,
         GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
         GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
         GGML_TYPE_Q6_K,
@@ -2111,7 +2111,7 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
     const ggml_type other_types[] = {
         GGML_TYPE_Q4_1,
         GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
-        GGML_TYPE_Q8_0,
+        GGML_TYPE_Q8_0, GGML_TYPE_MXFP4,
         GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
         GGML_TYPE_Q5_K,
         GGML_TYPE_Q6_K,
@@ -2665,6 +2665,10 @@ struct test_hotbank : test_case {
 
     bool validate(ggml_tensor * out) override {
         const auto values = tensor_to_float(out);
+        if (std::none_of(values.begin(), values.end(), [](float x) { return std::isfinite(x) && std::abs(x) > 1e-6f; })) {
+            printf("required output is vacuous ");
+            return false;
+        }
         if (which == router) {
             for (int64_t t = 0; t < tokens; ++t) {
                 std::vector<std::pair<double, int>> scores;
