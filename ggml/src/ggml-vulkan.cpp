@@ -6005,7 +6005,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_1, src1, { d_Qy, qy_buf_offset, VK_WHOLE_SIZE }, { d_Y, 0, VK_WHOLE_SIZE });
     }
 
-    uint32_t stride_batch_x = ne00*ne01;
+    uint32_t stride_batch_x = qx_needs_dequant ? ne00 * ne01 : src0->nb[2] / ggml_row_size(src0->type, ne00) * ne00;
     uint32_t stride_batch_y = ne10*ne11;
 
     if (!ggml_vk_dim01_contiguous(src0) && !qx_needs_dequant) {
@@ -6019,7 +6019,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // compute
     ggml_vk_matmul_id(
         ctx, subctx, pipeline,
-        { d_X, x_buf_offset, x_sz * ne02 * ne03 }, { d_Y, y_buf_offset, y_sz * ne12 * ne13 },
+        { d_X, x_buf_offset, qx_needs_dequant ? x_sz * ne02 * ne03 : ggml_nbytes(src0) }, { d_Y, y_buf_offset, y_sz * ne12 * ne13 },
         { d_D, d_buf_offset, d_sz * ne22 * ne23 }, { d_ids, ids_buf_offset, ids_sz },
         ne01, ne21, ne10, ne10, ne10, ne01,
         stride_batch_x, stride_batch_y, ne20*ne21,
@@ -6212,12 +6212,12 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     // compute
     const vk_mat_vec_id_push_constants pc = {
         (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
-        (uint32_t)x_ne, stride_batch_y, (uint32_t)(ne20*ne21),
+        (uint32_t)(qx_needs_dequant ? x_ne : src0->nb[2] / ggml_row_size(src0->type, ne00) * ne00), stride_batch_y, (uint32_t)(ne20*ne21),
         (uint32_t)nei0, (uint32_t)ne11,
     };
     ggml_vk_sync_buffers(subctx);
     ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
-        { vk_subbuffer{ d_X, x_buf_offset, x_sz * ne02 * ne03 },
+        { vk_subbuffer{ d_X, x_buf_offset, qx_needs_dequant ? x_sz * ne02 * ne03 : ggml_nbytes(src0) },
         vk_subbuffer{ d_Y, y_buf_offset, y_sz * ne12 * ne13 }, vk_subbuffer{ d_D, d_buf_offset, d_sz * ne22 * ne23}, vk_subbuffer{ d_ids, ids_buf_offset, ids_sz } },
         pc, { groups_x, (uint32_t)nei0, groups_z });
 }
