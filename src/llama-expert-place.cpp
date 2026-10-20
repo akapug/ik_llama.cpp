@@ -673,6 +673,12 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
                 const auto * buft = model.default_buffer_type_offload(model.default_layer_device[il]);
                 for (size_t i = 0; i < bufts.size(); ++i) if (bufts[i] == buft && !ggml_backend_is_cpu(backends[i])) device = (int) i;
             }
+            // LLAMA_HOT_EXPERTS_DEVICE=<backend name> (e.g. Vulkan0): the banks go to that device, not the layer's
+            if (const char * want_dev = getenv("LLAMA_HOT_EXPERTS_DEVICE"); want_dev && *want_dev) {
+                device = -1;
+                for (size_t i = 0; i < backends.size(); ++i) if (strcmp(ggml_backend_name(backends[i]), want_dev) == 0) device = (int) i;
+                if (device < 0) throw std::runtime_error(std::string("hot experts: LLAMA_HOT_EXPERTS_DEVICE=") + want_dev + " names no backend");
+            }
             if (device < 0) {
                 for (size_t i = 0; i < backends.size() && device < 0; ++i) if (!ggml_backend_is_cpu(backends[i])) device = (int) i;
             }

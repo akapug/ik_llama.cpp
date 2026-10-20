@@ -10918,7 +10918,9 @@ static bool ggml_backend_vk_supports_buft(ggml_backend_t backend, ggml_backend_b
 }
 
 static bool ggml_backend_vk_offload_op(ggml_backend_t backend, const ggml_tensor * op) {
-    const int min_batch_size = 32;
+    // GGML_VK_OFFLOAD_MIN_BATCH: smallest batch that copies a host weight to this device (default 32); a large value keeps
+    // host-resident experts on the CPU when Vulkan only holds hot expert banks beside CUDA
+    static const int min_batch_size = getenv("GGML_VK_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_VK_OFFLOAD_MIN_BATCH")) : 32;
 
     return (op->ne[1] >= min_batch_size && op->op != GGML_OP_GET_ROWS) ||
            (op->ne[2] >= min_batch_size && op->op == GGML_OP_MUL_MAT_ID);

@@ -68,6 +68,10 @@ void llama_set_mtp_n_heads(struct llama_context * ctx, int32_t mtp_n_heads);
 #  include "ggml-metal.h"
 #endif
 
+#if defined(GGML_USE_CUDA) && defined(GGML_USE_VULKAN)
+#  include "ggml-vulkan.h"
+#endif
+
 #ifdef __has_include
     #if __has_include(<unistd.h>)
         #include <unistd.h>
@@ -9959,6 +9963,25 @@ struct llama_context * llama_init_from_model(
             ggml_backend_add_from_device(ctx, backend);
         }
     }
+#endif
+
+#if defined(GGML_USE_CUDA) && defined(GGML_USE_VULKAN)
+        // A CUDA build that also carries Vulkan: LLAMA_EXTRA_VULKAN=1 adds the Vulkan devices after the CUDA ones (pick
+        // them with GGML_VK_VISIBLE_DEVICES; the Vulkan loader also lists the NVIDIA cards). The model's layers stay on
+        // CUDA; a Vulkan device is reached through tensors placed in its buffers, e.g. the hot expert banks
+        // (LLAMA_HOT_EXPERTS_DEVICE=Vulkan0).
+        if (getenv("LLAMA_EXTRA_VULKAN") && atoi(getenv("LLAMA_EXTRA_VULKAN")) != 0) {
+            for (int device = 0; device < ggml_backend_vk_get_device_count(); ++device) {
+                ggml_backend_t backend = ggml_backend_vk_init(device);
+                if (backend == nullptr) {
+                    LLAMA_LOG_ERROR("%s: failed to initialize Vulkan%d backend\n", __func__, device);
+                    llama_free(ctx);
+                    return nullptr;
+                }
+                LLAMA_LOG_INFO("%s: extra backend %s\n", __func__, ggml_backend_name(backend));
+                ggml_backend_add_from_device(ctx, backend);
+            }
+        }
 #endif
 
 #if defined(GGML_USE_RPC)
