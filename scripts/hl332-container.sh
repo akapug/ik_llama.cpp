@@ -32,6 +32,15 @@ for mode in mixed nonhost; do
   "$out/cpu/bin/test-expert-banks" "$mode" "$out/heat-fixed-$mode.tsv" 2>&1 | tee "$out/hot-bank-$mode.log"
   if "$out/cpu/bin/test-expert-banks-preimage" "$mode" "$out/heat-preimage-$mode.tsv" > "$out/hot-bank-preimage-$mode.log" 2>&1; then
     printf 'FAIL: exact hot-bank preimage unexpectedly passed %s\n' "$mode" >&2; exit 1
+  else
+    rc=$?
+    printf '%s\n' "$rc" > "$out/hot-bank-preimage-$mode.exit"
+    [ "$rc" = 1 ]
+    if [ "$mode" = mixed ]; then
+      grep -F 'mixed source lost its hot bank or a whole partition' "$out/hot-bank-preimage-$mode.log"
+    else
+      grep -F 'requested device-resident expert did not refuse' "$out/hot-bank-preimage-$mode.log"
+    fi
   fi
 done
 # Negative controls must fail: absent backend and a zero-matched operation.
