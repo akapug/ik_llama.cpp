@@ -224,6 +224,10 @@ struct gguf_context;
 std::string gguf_kv_to_str(const gguf_context * ctx_gguf, int i);
 
 ggml_backend_buffer_type_t llama_default_buffer_type_cpu(bool host_buffer);
+// the buffer type of CPU-side model weights: the GPU host (pinned) type, or with LLAMA_NO_HOST_WEIGHTS=1 (--no-host) the
+// plain CPU type, so the pinned budget holds only the compute/output buffers the GPU reads and NUMA placement can move pages
+ggml_backend_buffer_type_t llama_weight_buffer_type_cpu();
+bool llama_no_host_weights();
 
 struct llama_split_tensor {
     std::vector<ggml_tensor *> tensor_splits;

@@ -390,6 +390,15 @@ ggml_backend_buffer_type_t llama_default_buffer_type_cpu(bool host_buffer) {
     GGML_UNUSED(host_buffer);
 }
 
+bool llama_no_host_weights() {
+    static const bool on = getenv("LLAMA_NO_HOST_WEIGHTS") != nullptr && atoi(getenv("LLAMA_NO_HOST_WEIGHTS")) != 0;
+    return on;
+}
+
+ggml_backend_buffer_type_t llama_weight_buffer_type_cpu() {
+    return llama_default_buffer_type_cpu(!llama_no_host_weights());
+}
+
 //
 // globals
 //
@@ -4788,13 +4797,13 @@ static bool llm_load_tensors(
     bool use_mmap_buffer = true;
 
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    model.buft_input = llama_default_buffer_type_cpu(true);
+    model.buft_input = llama_weight_buffer_type_cpu();
 
     model.buft_layer.resize(n_layer);
 
     // assign cpu layers
     for (int i = 0; i < i_gpu_start; ++i) {
-        model.buft_layer[i] = llama_default_buffer_type_cpu(true);
+        model.buft_layer[i] = llama_weight_buffer_type_cpu();
     }
 
     std::vector<size_t> device_mem(model.devices.size());
@@ -5074,7 +5083,7 @@ static bool llm_load_tensors(
                 for (int il = 0; il < i_gpu_start; ++il) {
                     model.default_layer_device[il] = -1;
                     if (il < n_layer) {
-                        model.buft_layer[il] = llama_default_buffer_type_cpu(true);
+                        model.buft_layer[il] = llama_weight_buffer_type_cpu();
                     }
                 }
             }
@@ -5103,7 +5112,7 @@ static bool llm_load_tensors(
         if (n_gpu_layers > n_layer) {
             model.buft_output = llama_default_buffer_type_offload(model, model.devices[model.default_layer_device[n_layer]]);
         } else {
-            model.buft_output = llama_default_buffer_type_cpu(true);
+            model.buft_output = llama_weight_buffer_type_cpu();
         }
     } else {
         ggml_backend_buffer_type_t split_buft;
@@ -5142,7 +5151,7 @@ static bool llm_load_tensors(
                     ? 0 : std::max(0, model.default_layer_device[last_gpu_layer]);
             model.buft_output = llama_default_buffer_type_offload(model, dev);
         } else {
-            model.buft_output = llama_default_buffer_type_cpu(true);
+            model.buft_output = llama_weight_buffer_type_cpu();
         }
     }
 
@@ -5450,6 +5459,10 @@ static bool llm_load_tensors(
         }
     }
 #endif
+
+    if (llama_no_host_weights()) {
+        LLAMA_LOG_INFO("%s: model weights: CPU buffer type (LLAMA_NO_HOST_WEIGHTS), never pinned\n", __func__);
+    }
 
     // populate tensors_by_name
     for (ggml_context * ctx : model.ctxs) {

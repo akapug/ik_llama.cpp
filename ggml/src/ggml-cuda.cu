@@ -1674,7 +1674,14 @@ GGML_CALL static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_
     void * ptr = ggml_cuda_host_malloc(size, &budgeted);
 
     if (ptr == nullptr) {
-        // fallback to cpu buffer
+        // fallback to cpu buffer. A GPU reading this buffer zero-copy (a compute or output buffer under offload) then faults
+        // (NVRM Xid 31 on a host address), so say so: the first few fallbacks are logged with their size
+        static std::atomic<int> n_fallback{0};
+        if (size >= ((size_t) 1 << 20) && n_fallback.fetch_add(1) < 4) {
+            GGML_CUDA_LOG_WARN("%s: %.2f MiB %s buffer is pageable, not pinned: GPU zero-copy reads of it fault (Xid 31); "
+                               "with --no-mmap keep weights out of pinned memory (LLAMA_NO_HOST_WEIGHTS=1)\n", __func__,
+                               size / 1024.0 / 1024.0, ggml_backend_buft_name(buft));
+        }
         ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
         // a chunked buffer must not look CPU-typed: ~llama_model() calls get_base() on those
         if (buffer != nullptr && ggml_backend_cuda_host_buffer_type_get_max_size(buft) != SIZE_MAX) {
