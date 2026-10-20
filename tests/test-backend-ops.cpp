@@ -1,6 +1,7 @@
 #include <ggml.h>
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
+#include <cmath>
 
 #include <algorithm>
 #include <array>
@@ -297,6 +298,9 @@ enum test_mode {
     MODE_PERF,
 };
 
+static bool required_cases = false;
+static size_t executed_cases = 0;
+
 struct test_case {
     virtual ~test_case() {}
 
@@ -313,6 +317,8 @@ struct test_case {
     virtual double max_nmse_err() {
         return 1e-7;
     }
+
+    virtual bool validate(ggml_tensor *) { return true; }
 
     virtual void initialize_tensors(ggml_context * ctx) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
@@ -418,10 +424,11 @@ struct test_case {
             }
         }
         if (!supported) {
-            printf("\n");
+            printf(required_cases ? "REQUIRED UNSUPPORTED\n" : "\n");
             ggml_free(ctx);
-            return true;
+            return !required_cases;
         }
+        ++executed_cases;
 
         // post-graph sentinel
         add_sentinel(ctx);
@@ -526,11 +533,12 @@ struct test_case {
             printf("compare failed ");
         }
 
+        const bool oracle_ok = cmp_ok && validate(out);
         ggml_backend_buffer_free(buf);
 
         ggml_free(ctx);
 
-        if (ud.ok && cmp_ok) {
+        if (ud.ok && cmp_ok && oracle_ok) {
             printf("\033[1;32mOK\033[0m\n");
             return true;
         }
@@ -2512,6 +2520,7 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
         ggml_backend_t backend_cpu = ggml_backend_cpu_init();
 
         size_t n_ok = 0;
+        const size_t before = executed_cases;
         for (auto & test : test_cases) {
             if (test->eval(backend, backend_cpu, op_name)) {
                 n_ok++;
@@ -2521,7 +2530,7 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
 
         ggml_backend_free(backend_cpu);
 
-        return n_ok == test_cases.size();
+        return n_ok == test_cases.size() && executed_cases > before;
     }
 
     if (mode == MODE_PERF) {
@@ -2537,11 +2546,227 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
 
 static void usage(char ** argv) {
     printf("Usage: %s [mode] [-o op] [-b backend]\n", argv[0]);
+    printf("  --hotbank-cpu: required synthetic CPU controls, without device enumeration\n");
+    printf("  --hotbank-required BACKEND / --hotbank-v41 BACKEND: required device controls / full V4.1 shapes\n");
     printf("  valid modes are: test (compare with CPU backend for correctness) or perf (performance evaluation)\n");
     printf("  op names are as given by ggml_op_desc()\n");
 }
 
+// Synthetic, deterministic required controls. Full dimensions come from the
+// deepseek41 metadata: embedding 5120, expert FFN 2304, 384 experts, top six.
+struct test_hotbank : test_case {
+    enum kind { routed, fused, router, clamp, reduce, dense, chain } which;
+    ggml_type type;
+    int64_t k, m, tokens;
+    int experts, used;
+    bool strided, combined, inactive;
+    ggml_tensor * ids_storage = nullptr;
+
+    test_hotbank(kind which, ggml_type type = GGML_TYPE_F32, int64_t k = 64, int64_t m = 64,
+               int64_t tokens = 1, int experts = 384, bool strided = false,
+               bool combined = false, bool inactive = true, int used = 6)
+        : which(which), type(type), k(k), m(m), tokens(tokens), experts(experts), used(used),
+          strided(strided), combined(combined), inactive(inactive) {}
+
+    std::string vars() override {
+        return VARS_TO_STR10(which, type, k, m, tokens, experts, used, strided, combined, inactive);
+    }
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        if (which == router) {
+            auto * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, experts, tokens);
+            ggml_set_name(logits, "router_logits");
+            auto * probs = ggml_sqrt_softplus(ctx, logits);
+            auto * bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, experts, tokens);
+            ggml_set_name(bias, "selection_bias");
+            auto * selected = ggml_top_k(ctx, ggml_add(ctx, probs, bias), used);
+            auto * weights = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, experts, tokens), selected);
+            weights = ggml_reshape_2d(ctx, weights, used, tokens);
+            return ggml_scale(ctx, ggml_div(ctx, weights, ggml_sum_rows(ctx, weights)), 1.5f);
+        }
+        if (which == clamp || which == reduce) {
+            auto * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, m, used, tokens);
+            ggml_set_name(a, "gate_values");
+            auto * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, which == reduce ? 1 : m, used, tokens);
+            ggml_set_name(b, "up_values");
+            if (which == reduce) { return ggml_mul_multi_add(ctx, a, b); }
+            auto * out = ggml_fused_mul_unary(ctx, a, b, GGML_UNARY_OP_SILU);
+            const float limit = 10.0f;
+            memcpy(out->op_params + 1, &limit, sizeof(limit));
+            return out;
+        }
+        auto * up = ggml_new_tensor_3d(ctx, type, k, m * (combined && which != routed ? 2 : 1), which == dense ? 1 : experts);
+        ggml_set_name(up, "expert_up");
+        auto * gate = combined || which == routed ? nullptr : ggml_new_tensor_3d(ctx, type, k, m, which == dense ? 1 : experts);
+        if (gate) { ggml_set_name(gate, "expert_gate"); }
+        if (which == dense) {
+            auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+            return ggml_fused_up_gate(ctx, up, gate, x, GGML_UNARY_OP_SILU);
+        }
+        ids_storage = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, strided ? used + 3 : used, tokens);
+        ggml_set_name(ids_storage, "partition_ids");
+        auto * ids = strided ? ggml_view_2d(ctx, ids_storage, used, tokens, ids_storage->nb[1], 0) : ids_storage;
+        auto * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, which == routed && combined ? used : 1, tokens);
+        if (which == routed) { return ggml_mul_mat_id(ctx, up, x, ids); }
+        auto * h = ggml_moe_up_gate(ctx, up, gate, x, ids, GGML_UNARY_OP_SILU);
+        const float limit = 10.0f;
+        memcpy(h->op_params + 1, &limit, sizeof(limit));
+        if (which != chain) { return h; }
+        auto * down = ggml_new_tensor_3d(ctx, type, m, k, experts);
+        auto * result = ggml_mul_mat_id(ctx, down, h, ids);
+        auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, used, tokens);
+        return ggml_mul_multi_add(ctx, result, weights);
+    }
+
+    static float sample(int64_t row, int64_t col) {
+        const uint32_t h = uint32_t(row + 1) * 1664525u + uint32_t(col + 1) * 1013904223u;
+        return (int((h ^ (h >> 13)) % 33) - 16) / 16.0f;
+    }
+    static float boundary(int64_t i) {
+        static const float values[] = {-80, -20, -10.01f, -10, -1, 0, 1, 9.99f, 10, 10.01f, 20, 80};
+        return values[i % (sizeof(values) / sizeof(values[0]))];
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) { continue; }
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> row(t->ne[0]);
+                for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                    for (int64_t c = 0; c < t->ne[0]; ++c) {
+                        row[c] = inactive && (r % 3 == 1 || (r + c) % 3 == 1) ? -1 : (c == 0 ? experts - 1 : (c * 61 + r * 7) % experts);
+                    }
+                    ggml_backend_tensor_set(t, row.data(), r * t->nb[1], row.size() * sizeof(int32_t));
+                }
+                continue;
+            }
+            std::vector<float> row(t->ne[0]);
+            std::vector<uint8_t> packed(ggml_row_size(t->type, t->ne[0]));
+            for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                for (int64_t c = 0; c < t->ne[0]; ++c) {
+                    row[c] = t->op == GGML_OP_NONE ? sample(r, c) : NAN;
+                    if (!strcmp(t->name, "gate_values") || !strcmp(t->name, "up_values") || !strcmp(t->name, "router_logits")) {
+                        row[c] = boundary(r * t->ne[0] + c);
+                    }
+                    if (!strcmp(t->name, "router_logits")) { row[c] += c / 1000.0f; }
+                    if (!strcmp(t->name, "selection_bias")) { row[c] = c == 1 ? 100.0f : 0.0f; }
+                }
+                if (t->type == GGML_TYPE_F32) {
+                    ggml_backend_tensor_set(t, row.data(), r * t->nb[1], row.size() * sizeof(float));
+                    continue;
+                }
+                // Ordinary packed rows, shared verbatim with the reference backend.
+                // Never substitute MXFP4_R8/Q8_0_R8 or repack CPU weights for this comparison.
+                ggml_quantize_chunk(t->type, row.data(), packed.data(), 0, 1, t->ne[0], nullptr);
+                ggml_backend_tensor_set(t, packed.data(), r * t->nb[1], packed.size());
+            }
+        }
+    }
+
+    bool validate(ggml_tensor * out) override {
+        const auto values = tensor_to_float(out);
+        if (which == router) {
+            for (int64_t t = 0; t < tokens; ++t) {
+                std::vector<std::pair<double, int>> scores;
+                std::vector<double> probabilities(experts);
+                for (int e = 0; e < experts; ++e) {
+                    const double x = boundary(t * experts + e) + e / 1000.0f;
+                    probabilities[e] = std::sqrt(x > 20 ? x : std::log1p(std::exp(x)));
+                    scores.emplace_back(probabilities[e] + (e == 1 ? 100 : 0), e);
+                }
+                std::sort(scores.rbegin(), scores.rend());
+                double sum = 0;
+                for (int e = 0; e < used; ++e) { sum += probabilities[scores[e].second]; }
+                for (int e = 0; e < used; ++e) {
+                    const double expected = 1.5 * probabilities[scores[e].second] / sum;
+                    if (std::abs(values[t * used + e] - expected) > 1e-5) { return false; }
+                }
+            }
+        }
+        if (which == clamp) {
+            for (size_t i = 0; i < values.size(); ++i) {
+                const float g = boundary(i), u = boundary(i);
+                const float expected = std::min(g / (1 + std::exp(-g)), 10.0f) * std::max(-10.0f, std::min(u, 10.0f));
+                if (std::abs(values[i] - expected) > 1e-4f) { return false; }
+            }
+        }
+        if ((which == routed || which == fused) && inactive) {
+            for (int64_t t = 0; t < tokens; ++t) {
+                for (int e = 0; e < used; ++e) {
+                    if (t % 3 == 1 || (t + e) % 3 == 1) {
+                        for (int64_t r = 0; r < out->ne[0]; ++r) {
+                            if (values[(t * used + e) * out->ne[0] + r] != 0) { return false; }
+                        }
+                    }
+                }
+            }
+        }
+        if (which == reduce) {
+            for (int64_t t = 0; t < tokens; ++t) {
+                for (int64_t r = 0; r < m; ++r) {
+                    double expected = 0;
+                    for (int e = 0; e < used; ++e) { expected += boundary((t * used + e) * m + r) * boundary(t * used + e); }
+                    if (std::abs(values[t * m + r] - expected) > 0.01) { return false; }
+                }
+            }
+        }
+        return true;
+    }
+};
+
+static int test_hotbank_required(bool cpu_only, bool full, const char * backend_name) {
+    required_cases = true;
+    executed_cases = 0;
+    ggml_backend_t backend = nullptr;
+    if (cpu_only) {
+        // Deliberately bypass the registry: CPU controls must not enumerate GPUs.
+        backend = ggml_backend_cpu_init();
+    } else {
+        for (size_t i = 0; i < ggml_backend_reg_get_count(); ++i) {
+            if (!strcmp(backend_name, ggml_backend_reg_get_name(i))) { backend = ggml_backend_reg_init_backend(i, nullptr); break; }
+        }
+    }
+    if (!backend) { fprintf(stderr, "required backend absent: %s\n", backend_name); return 1; }
+    ggml_backend_t reference = ggml_backend_cpu_init();
+    ggml_backend_cpu_set_n_threads(reference, 2);
+    if (cpu_only) { ggml_backend_cpu_set_n_threads(backend, 2); }
+    std::vector<std::unique_ptr<test_hotbank>> cases;
+    using T = test_hotbank;
+    for (auto q : {GGML_TYPE_MXFP4, GGML_TYPE_Q8_0}) {
+        for (int n : {1, 3}) {
+            for (bool stride : {false, true}) {
+                cases.emplace_back(new T(T::routed, q, 64, 64, n, 384, stride));
+                cases.emplace_back(new T(T::fused, q, 64, 64, n, 384, stride));
+            }
+            cases.emplace_back(new T(T::fused, q, 64, 64, n, 384, true, true));
+            cases.emplace_back(new T(T::chain, q, 64, 64, n, 384, true));
+            cases.emplace_back(new T(T::dense, q, 64, 64, n));
+            if (full) {
+                cases.emplace_back(new T(T::routed, q, 5120, 2304, n, 384, true));
+                cases.emplace_back(new T(T::routed, q, 2304, 5120, n, 384, true, true));
+            }
+        }
+    }
+    // Six times 683 crosses the internal 4096-ID batch capacity.
+    for (auto q : {GGML_TYPE_MXFP4, GGML_TYPE_Q8_0}) {
+        cases.emplace_back(new T(T::routed, q, 64, 64, 683, 384, true));
+    }
+    for (auto k : {T::router, T::clamp, T::reduce}) { cases.emplace_back(new T(k, GGML_TYPE_F32, 64, 64, 3)); }
+    cases.emplace_back(new T(T::reduce, GGML_TYPE_F32, 64, 64, 3, 384, false, false, false, 1));
+    size_t passed = 0;
+    for (auto & c : cases) { passed += c->eval(backend, reference, nullptr); }
+    printf("HOTBANK required: passed=%zu expected=%zu executed=%zu cpu_only=%d full_shape=%d\n", passed, cases.size(), executed_cases, cpu_only, full);
+    ggml_backend_free(reference);
+    ggml_backend_free(backend);
+    ggml_quantize_free();
+    return passed == cases.size() && executed_cases == cases.size() && !cases.empty() ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
+    if (argc == 2 && !strcmp(argv[1], "--hotbank-cpu")) { return test_hotbank_required(true, false, "CPU"); }
+    if (argc == 3 && (!strcmp(argv[1], "--hotbank-required") || !strcmp(argv[1], "--hotbank-v41"))) {
+        return test_hotbank_required(false, !strcmp(argv[1], "--hotbank-v41"), argv[2]);
+    }
     test_mode mode = MODE_TEST;
     const char * op_name_filter = NULL;
     const char * backend_filter = NULL;
@@ -2575,6 +2800,7 @@ int main(int argc, char ** argv) {
     printf("Testing %zu backends\n\n", ggml_backend_reg_get_count());
 
     size_t n_ok = 0;
+    size_t selected_backends = 0;
 
     for (size_t i = 0; i < ggml_backend_reg_get_count(); i++) {
         printf("Backend %zu/%zu (%s)\n", i + 1, ggml_backend_reg_get_count(), ggml_backend_reg_get_name(i));
@@ -2595,6 +2821,7 @@ int main(int argc, char ** argv) {
             continue;
         }
 
+        ++selected_backends;
         printf("  Backend name: %s\n", ggml_backend_name(backend));
 
         bool ok = test_backend(backend, mode, op_name_filter);
@@ -2614,7 +2841,7 @@ int main(int argc, char ** argv) {
 
     printf("%zu/%zu backends passed\n", n_ok, ggml_backend_reg_get_count());
 
-    if (n_ok != ggml_backend_reg_get_count()) {
+    if (selected_backends == 0 || n_ok != ggml_backend_reg_get_count()) {
         printf("\033[1;31mFAIL\033[0m\n");
         return 1;
     }

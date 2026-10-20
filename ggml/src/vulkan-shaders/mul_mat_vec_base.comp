@@ -42,7 +42,11 @@ layout (push_constant) uniform parameter
 #endif
 } p;
 
-void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+layout (constant_id = 1) const uint NUM_ROWS = 1;
+layout (constant_id = 2) const uint NUM_COLS = 1;
+
+bool get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #ifdef MUL_MAT_ID
     const uint expert_idx = gl_GlobalInvocationID.y;
 #else
@@ -82,11 +86,20 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #else
             batch_idx * p.batch_stride_d;
 #endif
+#ifdef MUL_MAT_ID
+    if (data_ids[expert_idx] < 0) {
+        if (gl_LocalInvocationID.x == 0) {
+            const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+            for (uint r = first_row; r < min(first_row + NUM_ROWS, p.stride_d); ++r) {
+                data_d[d_offset + r] = D_TYPE(0);
+            }
+        }
+        return false;
+    }
+#endif
+    return true;
 }
 
-layout (constant_id = 0) const uint BLOCK_SIZE = 32;
-layout (constant_id = 1) const uint NUM_ROWS = 1;
-layout (constant_id = 2) const uint NUM_COLS = 1;
 
 shared FLOAT_TYPE tmpsh[NUM_COLS][NUM_ROWS][BLOCK_SIZE];
 
