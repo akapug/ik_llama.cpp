@@ -25,6 +25,11 @@ trap 'rc=$?; if (( rc )); then printf "BUILD_FAILED exit=%s\\n" "$rc" > "$out/re
 printf '%s\n' "$expected_tree" > "$out/source-tree.txt"
 printf '%s\n' "$expected_commit" > "$out/source-commit.txt"
 printf '%s\n' "$image" > "$out/image-request.txt"
+mkdir "$out/preimage"
+# Exact fixed-source predecessor for fail-without controls, not a hand-patched
+# substitute consumer. It is compiled only in the CPU-only control build.
+git show c6e403fba2f6536e06d198c125478df7b33d54cd:src/llama-expert-place.cpp > "$out/preimage/llama-expert-place.cpp"
+sha256sum "$out/preimage/llama-expert-place.cpp" > "$out/preimage-sha256.txt"
 # Container images/dependencies are the only network input of this build.
 docker pull "$image" 2>&1 | tee "$out/image-pull.log"
 image_id=$(docker image inspect --format '{{.Id}}' "$image")

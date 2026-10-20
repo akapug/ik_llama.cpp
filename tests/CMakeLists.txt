@@ -198,6 +198,16 @@ find_package(Threads REQUIRED)
 add_executable(test-backend-ops test-backend-ops.cpp)
 target_link_libraries(test-backend-ops PRIVATE ggml Threads::Threads)
 add_test(NAME test-backend-moe-cpu COMMAND $<TARGET_FILE:test-backend-ops> --hl332-cpu)
+
+add_executable(test-expert-banks test-expert-banks.cpp)
+target_include_directories(test-expert-banks PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+target_link_libraries(test-expert-banks PRIVATE llama)
+# Optional exact committed preimage, supplied as a job-owned source by Fab.
+if(HL332_PREIMAGE_SOURCE)
+    add_executable(test-expert-banks-preimage test-expert-banks.cpp ${HL332_PREIMAGE_SOURCE})
+    target_include_directories(test-expert-banks-preimage PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-expert-banks-preimage PRIVATE llama)
+endif()
 set_property(TEST test-backend-moe-cpu PROPERTY LABELS main)
 
 # header-only pinned-memory budget of the CUDA backend; needs no GPU, so it builds in every configuration

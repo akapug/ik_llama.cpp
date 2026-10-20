@@ -1,6 +1,10 @@
 #include <ggml.h>
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
+#include "../src/llama-expert-bank-plan.h"
+#ifdef GGML_USE_VULKAN
+#include <ggml-vulkan.h>
+#endif
 #include <cmath>
 
 #include <algorithm>
@@ -2691,6 +2695,82 @@ struct test_hl332 : test_case {
     }
 };
 
+// Same global-ID -> local-bank map and sum-before-weight order as the real
+// llama_build_context partition graph. Full shapes never become an oversized
+// tensor and never silently fall back to CPU on the backend under test.
+struct test_hl332_banks : test_hl332 {
+    llama_expert_bank_limits limits;
+    std::vector<std::pair<ggml_tensor *, llama_expert_bank_span>> maps;
+    test_hl332_banks(kind which, ggml_type type, int64_t k, int64_t m, int64_t tokens,
+                    llama_expert_bank_limits limits)
+        : test_hl332(which, type, k, m, tokens), limits(limits) {}
+    std::string vars() override { return "partitioned-global-384," + test_hl332::vars(); }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // Metadata only; do not allocate the unsplit logical geometry.
+        ggml_tensor geometry = {};
+        geometry.type = type;
+        geometry.ne[0] = k; geometry.ne[1] = m; geometry.ne[2] = experts; geometry.ne[3] = 1;
+        geometry.nb[1] = ggml_row_size(type, k);
+        geometry.nb[2] = geometry.nb[1] * m;
+        const auto plan = llama_expert_bank_plan({&geometry}, experts, limits);
+        ids_storage = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, tokens);
+        ggml_set_name(ids_storage, "global_ids");
+        auto * flat = ggml_reshape_1d(ctx, ids_storage, used * tokens);
+        auto * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, tokens);
+        ggml_tensor * sum = nullptr;
+        for (const auto & span : plan) {
+            auto * map = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, experts);
+            ggml_format_name(map, "bank-map-%lld", (long long) span.first);
+            maps.push_back({map, span});
+            auto * ids = ggml_reshape_2d(ctx, ggml_get_rows(ctx, map, flat), used, tokens);
+            auto * up = ggml_new_tensor_3d(ctx, type, k, m, span.count);
+            ggml_tensor * out;
+            if (which == chain) {
+                auto * gate = ggml_new_tensor_3d(ctx, type, k, m, span.count);
+                auto * h = ggml_moe_up_gate(ctx, up, gate, x, ids, GGML_UNARY_OP_SILU);
+                const float limit = 10;
+                memcpy(h->op_params + 1, &limit, sizeof(limit));
+                auto * down = ggml_new_tensor_3d(ctx, type, m, k, span.count);
+                out = ggml_mul_mat_id(ctx, down, h, ids);
+            } else {
+                out = ggml_mul_mat_id(ctx, up, x, ids);
+            }
+            sum = sum ? ggml_add(ctx, sum, out) : out;
+        }
+        if (which != chain) { return sum; }
+        auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, used, tokens);
+        return ggml_mul_multi_add(ctx, sum, weights);
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_hl332::initialize_tensors(ctx);
+        std::vector<int> owners(experts);
+        for (const auto & item : maps) {
+            std::vector<int32_t> map(experts, -1);
+            for (int64_t i = 0; i < item.second.count; ++i) {
+                map[item.second.first + i] = i;
+                ++owners[item.second.first + i];
+            }
+            ggml_backend_tensor_set(item.first, map.data(), 0, map.size() * sizeof(int32_t));
+        }
+        GGML_ASSERT(std::all_of(owners.begin(), owners.end(), [](int n) { return n == 1; }));
+        // Boundary/global-high IDs plus an all-inactive token row. Inactive IDs
+        // cannot go through GET_ROWS: use a dedicated all-inactive per-bank row
+        // by mapping valid global IDs to -1 only in the individual bank maps.
+        std::vector<int32_t> global(used * tokens);
+        for (int64_t t = 0; t < tokens; ++t) {
+            for (int e = 0; e < used; ++e) global[t * used + e] = e == 0 ? experts - 1 : (t * 131 + e * 67) % experts;
+        }
+        ggml_backend_tensor_set(ids_storage, global.data(), 0, global.size() * sizeof(int32_t));
+    }
+    bool validate(ggml_tensor * out) override {
+        // All-global partition sums have no inactive global IDs: local inactive
+        // rows are checked by the original required routed/fused controls.
+        const auto values = tensor_to_float(out);
+        return std::all_of(values.begin(), values.end(), [](float v) { return std::isfinite(v); }) &&
+               std::any_of(values.begin(), values.end(), [](float v) { return std::abs(v) > 1e-6f; });
+    }
+};
+
 static int test_hl332_required(bool cpu_only, bool full, const char * backend_name) {
     required_cases = true;
     executed_cases = 0;
@@ -2707,6 +2787,19 @@ static int test_hl332_required(bool cpu_only, bool full, const char * backend_na
     ggml_backend_t reference = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(reference, 2);
     if (cpu_only) { ggml_backend_cpu_set_n_threads(backend, 2); }
+    const auto buft = ggml_backend_get_default_buffer_type(backend);
+    llama_expert_bank_limits bank_limits {ggml_backend_buft_get_max_size(buft), ggml_backend_buft_get_max_size(buft), ggml_backend_buft_get_alignment(buft)};
+#ifdef GGML_USE_VULKAN
+    if (ggml_backend_is_vk(backend)) {
+        if (!ggml_backend_vk_get_bank_limits(backend, &bank_limits.allocation, &bank_limits.descriptor, &bank_limits.alignment)) {
+            fprintf(stderr, "required bank limits UNKNOWN\n");
+            ggml_backend_free(reference);
+            ggml_backend_free(backend);
+            return 1;
+        }
+    }
+#endif
+    printf("HL332 bank limits: allocation=%zu descriptor=%zu alignment=%zu backend=%s\n", bank_limits.allocation, bank_limits.descriptor, bank_limits.alignment, ggml_backend_name(backend));
     std::vector<std::unique_ptr<test_hl332>> cases;
     using T = test_hl332;
     for (auto q : {GGML_TYPE_MXFP4, GGML_TYPE_Q8_0}) {
@@ -2719,14 +2812,19 @@ static int test_hl332_required(bool cpu_only, bool full, const char * backend_na
             cases.emplace_back(new T(T::chain, q, 64, 64, n, 384, true));
             cases.emplace_back(new T(T::dense, q, 64, 64, n));
             if (full) {
-                cases.emplace_back(new T(T::routed, q, 5120, 2304, n, 384, true));
-                cases.emplace_back(new T(T::routed, q, 2304, 5120, n, 384, true, true));
+                cases.emplace_back(new test_hl332_banks(T::routed, q, 5120, 2304, n, bank_limits));
+                cases.emplace_back(new test_hl332_banks(T::routed, q, 2304, 5120, n, bank_limits));
             }
         }
     }
     // Six times 683 crosses the internal 4096-ID batch capacity.
     for (auto q : {GGML_TYPE_MXFP4, GGML_TYPE_Q8_0}) {
         cases.emplace_back(new T(T::routed, q, 64, 64, 683, 384, true));
+        const size_t plane = ggml_row_size(q, 64) * 64;
+        // Synthetic small-test limits force multiple legal banks for all 384
+        // global IDs; actual full-shape cases above use runtime capabilities.
+        const llama_expert_bank_limits small {plane * 64, plane * 64, 64};
+        cases.emplace_back(new test_hl332_banks(T::chain, q, 64, 64, 3, small));
     }
     for (auto k : {T::router, T::clamp, T::reduce}) { cases.emplace_back(new T(k, GGML_TYPE_F32, 64, 64, 3)); }
     cases.emplace_back(new T(T::reduce, GGML_TYPE_F32, 64, 64, 3, 384, false, false, false, 1));

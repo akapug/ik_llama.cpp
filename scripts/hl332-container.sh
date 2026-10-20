@@ -24,9 +24,16 @@ common=(
 )
 # The CPU-only executable has no GPU registry entries. This is a control build,
 # not the mixed deliverable and not a substitute for its compilation.
-cmake -S /source -B "$out/cpu" "${common[@]}" -DGGML_CUDA=OFF -DGGML_VULKAN=OFF 2>&1 | tee "$out/cpu-configure.log"
-cmake --build "$out/cpu" --parallel "$cores" --target test-backend-ops 2>&1 | tee "$out/cpu-build.log"
+cmake -S /source -B "$out/cpu" "${common[@]}" -DGGML_CUDA=OFF -DGGML_VULKAN=OFF \
+  -DHL332_PREIMAGE_SOURCE="$out/preimage/llama-expert-place.cpp" 2>&1 | tee "$out/cpu-configure.log"
+cmake --build "$out/cpu" --parallel "$cores" --target test-backend-ops test-expert-banks test-expert-banks-preimage 2>&1 | tee "$out/cpu-build.log"
 "$out/cpu/bin/test-backend-ops" --hl332-cpu 2>&1 | tee "$out/cpu-controls.log"
+for mode in mixed nonhost; do
+  "$out/cpu/bin/test-expert-banks" "$mode" "$out/heat-fixed-$mode.tsv" 2>&1 | tee "$out/hot-bank-$mode.log"
+  if "$out/cpu/bin/test-expert-banks-preimage" "$mode" "$out/heat-preimage-$mode.tsv" > "$out/hot-bank-preimage-$mode.log" 2>&1; then
+    printf 'FAIL: exact hot-bank preimage unexpectedly passed %s\n' "$mode" >&2; exit 1
+  fi
+done
 # Negative controls must fail: absent backend and a zero-matched operation.
 if "$out/cpu/bin/test-backend-ops" --hl332-required HL332-absent > "$out/absent-backend.log" 2>&1; then
   printf 'FAIL: missing backend was accepted\n' >&2; exit 1
