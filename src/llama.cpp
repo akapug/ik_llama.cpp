@@ -9979,6 +9979,8 @@ struct llama_context * llama_init_from_model(
                     return nullptr;
                 }
                 LLAMA_LOG_INFO("%s: extra backend %s\n", __func__, ggml_backend_name(backend));
+                // cparams.devices lists the model's devices (CUDA) and filters/reorders ctx->backends: list this one too
+                if (ctx->cparams.devices.size()) ctx->cparams.devices.push_back(ggml_backend_name(backend));
                 ggml_backend_add_from_device(ctx, backend);
             }
         }
