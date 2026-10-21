@@ -1087,7 +1087,20 @@ struct ggml_backend_vk_context {
     size_t in_staging_off {};
     bool in_recorded {};
     std::vector<ggml_backend_t> in_src_pending;
+    // GGML_VK_STAGED_INPUTS readback: the graph's last node is copied into out_staging by its last command buffer
+    vk_buffer out_staging;
+    ggml_tensor * readback_node {};
 };
+
+// the one staged readback alive (vk_rb.valid): bytes [off, off + size) of src are in ctx->out_staging once ctx's graph
+// is finished. A read of them is a memcpy; a new graph on ctx or any write to a Vulkan buffer ends it.
+struct vk_readback {
+    ggml_backend_vk_context * ctx {};
+    vk_buffer src;
+    size_t off {}, size {};
+    bool valid {};
+};
+static vk_readback vk_rb;
 
 static bool ggml_vk_async_graph() {
     static const bool on = [] { const char * e = getenv("GGML_VK_ASYNC_GRAPH"); return e && atoi(e) != 0; }();
@@ -9670,6 +9683,22 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 #endif
 
     if (submit || last_node) {
+        if (last_node && ctx->readback_node) {
+            ggml_tensor * t = ctx->readback_node;
+            const size_t n = ggml_nbytes(t);
+            if (!ctx->out_staging || ctx->out_staging->size < n) {
+                ggml_vk_destroy_buffer(ctx->out_staging);
+                ctx->out_staging = ggml_vk_create_buffer_check(ctx->device, std::max<size_t>(n, 1 << 20),
+                    vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+                    vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+            }
+            vk_buffer src = ((ggml_backend_vk_buffer_context *) t->buffer->context)->dev_buffer;
+            VkBufferCopy bc = { vk_tensor_offset(t) + t->view_offs, 0, n };
+            ggml_vk_sync_buffers(compute_ctx);
+            vkCmdCopyBuffer(compute_ctx->s->buffer, (VkBuffer) src->buffer, (VkBuffer) ctx->out_staging->buffer, 1, &bc);
+            vk_rb = { ctx, src, bc.srcOffset, n, true };
+            ctx->readback_node = nullptr;
+        }
         ggml_vk_ctx_end(compute_ctx);
 
         // TODO probably it'd be better to pass a exit_node flag to ggml_vk_compute_forward
@@ -9915,6 +9944,10 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
         ctx->lower_buf = nullptr;
     }
     ggml_vk_destroy_buffer(ctx->in_staging);
+    ggml_vk_destroy_buffer(ctx->out_staging);
+    if (vk_rb.ctx == ctx) {
+        vk_rb = {};
+    }
 
     ggml_vk_destroy_buffer(ctx->prealloc_x);
     ggml_vk_destroy_buffer(ctx->prealloc_y);
@@ -10004,6 +10037,7 @@ static void ggml_backend_vk_buffer_memset_tensor(ggml_backend_buffer_t buffer, g
     vk_buffer buf = buf_ctx->dev_buffer;
 
     uint32_t val32 = (uint32_t)value * 0x01010101;
+    vk_rb.valid = false;
     ggml_vk_buffer_memset(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, val32, size);
 }
 
@@ -10012,6 +10046,7 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
     vk_buffer buf = buf_ctx->dev_buffer;
 
+    vk_rb.valid = false;
     ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
 }
 
@@ -10020,8 +10055,14 @@ GGML_CALL static void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t bu
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
 
     vk_buffer buf = buf_ctx->dev_buffer;
+    const size_t off = vk_tensor_offset(tensor) + tensor->view_offs + offset;
+    if (vk_rb.valid && vk_rb.src == buf && off >= vk_rb.off && off + size <= vk_rb.off + vk_rb.size) {
+        ggml_vk_finish_pending(vk_rb.ctx);
+        memcpy(data, (const uint8_t *) vk_rb.ctx->out_staging->ptr + (off - vk_rb.off), size);
+        return;
+    }
 
-    ggml_vk_buffer_read(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
+    ggml_vk_buffer_read(buf, off, data, size);
 }
 
 GGML_CALL static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -10032,6 +10073,7 @@ GGML_CALL static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t bu
         vk_buffer src_buf = src_buf_ctx->dev_buffer;
         vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
 
+        vk_rb.valid = false;
         ggml_vk_buffer_copy(dst_buf, vk_tensor_offset(dst) + dst->view_offs, src_buf, vk_tensor_offset(src) + src->view_offs, ggml_nbytes(src));
 
         return true;
@@ -10044,6 +10086,7 @@ GGML_CALL static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t bu
 GGML_CALL static void ggml_backend_vk_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
 
+    vk_rb.valid = false;
     ggml_vk_buffer_memset(ctx->dev_buffer, 0, value, buffer->size);
 }
 
@@ -10301,6 +10344,7 @@ GGML_CALL static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_sr
     vkCmdCopyBuffer(cctx->s->buffer, (VkBuffer) ctx->in_staging->buffer, (VkBuffer) dst_ctx->dev_buffer->buffer, 1, &bc);
     ctx->in_staging_off = off + n;
     ctx->in_recorded = true;
+    vk_rb.valid = false;
     return true;
 }
 
@@ -10483,6 +10527,20 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     if (ctx->in_recorded && !ctx->compute_ctx.expired()) {
         vk_context c = ctx->compute_ctx.lock();
         ggml_vk_sync_buffers(c);
+    }
+    if (vk_rb.ctx == ctx) {
+        vk_rb.valid = false;
+    }
+    ctx->readback_node = nullptr;
+    if (ggml_vk_staged_inputs() && !vk_perf_logger_enabled) {
+        int k = cgraph->n_nodes - 1;
+        while (k > 0 && ggml_vk_is_empty(cgraph->nodes[k])) {
+            k--;
+        }
+        ggml_tensor * t = k >= 0 ? cgraph->nodes[k] : nullptr;
+        if (t && t->buffer && ggml_backend_buffer_is_vk(t->buffer) && ggml_is_contiguous(t) && ggml_nbytes(t) <= ggml_vk_staged_inputs_cap()) {
+            ctx->readback_node = t;
+        }
     }
 
     if (vk_instance.debug_utils_support) {
