@@ -76,8 +76,7 @@ int main(int argc, char ** argv) {
     memset(down->data, 1, ggml_nbytes(down));
     memset(qb->data, 1, ggml_nbytes(qb));
     memset(woa->data, 1, ggml_nbytes(woa));
-    if (prebind) llama_expert_numa_apply(model, false);   // after the read, as the deferred loader does
-    llama_expert_numa_report(model);
+    if (!prebind) llama_expert_numa_report(model);   // prebind: the checks below run before any apply could migrate a page
 
     int bad = 0, checked = 0;
     for (ggml_tensor * t : { up, down }) {
@@ -115,7 +114,11 @@ int main(int argc, char ** argv) {
             }
         }
     }
-    printf("checked %d whole pages, %d misplaced\n", checked, bad);
+    if (prebind) {   // then the after-load apply, as the deferred loader does: it must find the pages placed
+        llama_expert_numa_apply(model, false);
+        llama_expert_numa_report(model);
+    }
+    printf("checked %d whole pages, %d misplaced%s\n", checked, bad, prebind ? " before the after-load apply" : "");
     model.layers[0].ffn_up_exps = model.layers[0].ffn_down_exps = nullptr;
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
