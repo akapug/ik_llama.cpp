@@ -79,8 +79,9 @@ Goal: put a second, different GPU (an MI25 on Vulkan) next to a CUDA card and gi
 | `LLAMA_EXTRA_VULKAN=1` | off | in a CUDA+Vulkan build, adds the Vulkan devices after CUDA (layers stay on CUDA; `GGML_VK_VISIBLE_DEVICES` picks the card) |
 | `LLAMA_HOT_EXPERTS=<file>` | off | static hot-expert set placed in GPU banks (banks belong to the model and are shared by its contexts) |
 | `LLAMA_HOT_EXPERTS_DEVICE=<backend>` | layer device | puts the hot banks on that backend, e.g. `Vulkan0` |
+| heat-file third column | none | `blk.N <expert ids> <backend>` puts that layer's bank on that backend (over `LLAMA_HOT_EXPERTS_DEVICE`); a layer whose every expert is banked gets no host rest split |
 | `GGML_VK_OFFLOAD_MIN_BATCH` | 32 | keeps host-resident experts from being copied to Vulkan for prefill |
-| `LLAMA_HOT_BANK_FIRST=1` | off | issues the bank split before the CPU cold-expert split |
+| `LLAMA_HOT_BANK_FIRST=1` | off | issues the bank split before the CPU cold-expert split (every partition output is expanded in graph order, side work first) |
 | `LLAMA_HOT_COMBINE=<backend>` | bank backend | runs the partition sum there |
 | `GGML_VK_ASYNC_GRAPH=1` | off | the Vulkan graph returns after its last submit; the fence wait moves to synchronize |
 | `GGML_VK_STAGED_INPUTS=1` (`_MIB`) | off | split inputs through one host-visible staging buffer, plus a staged readback of the last node |
@@ -95,8 +96,14 @@ Measured:
 - Correctness: on the MI25 the device checks pass 35 of 36. The one failure is the Vulkan `ARGSORT` over 384 experts
   (NMSE 0.554), so routing must stay off the Vulkan device. CPU controls pass 36 of 36. On V4.1 with 799 hot experts
   (14 GiB) on the MI25, the greedy text is identical to the CPU-expert arm.
-- Speed: **the MI25 banks are correct but currently slower.** V4.1 on Box A gives n4 2.66 and n0 4.08 with the banks,
-  against 7.13 and 6.97 without them.
+- Speed on V4.1: **the MI25 banks are correct but slower.** V4.1 on Box A gives n4 2.66 and n0 4.08 with the banks,
+  against 7.13 and 6.97 without them. With the MI25 clocks forced high, `GGML_VK_MMVID_MAX_TOKENS=8` and a bank-first
+  order that really reorders the graph, it is n4 6.19 and n0 5.61: still behind. A per-op profile of one decode graph
+  shows why. The banks cover 31.6 % of the routed traffic and save about 13.5 ms of CPU expert time. The extra device
+  hops (Vulkan splits, the bank down split, a larger CUDA combine) add about 40 ms. On V4.1 the lever is bound by hop
+  latency, so we stopped it there.
+- Before the bank-first fix, `LLAMA_HOT_BANK_FIRST=1` reordered nothing. The bank output was not expanded into the
+  graph and was pulled in only by the final sum, so its device split still ran after the CPU split.
 - Fixed-cost cures, Qwen3-30B-A3B smoke, decode ms per graph: banks 141 -> 107 with async graph, bank-first and combine on
   CUDA0. CPU experts alone take 86 ms. Staged inputs cut the Vulkan split's copy-in from 4.3 to 3.0 ms. Staged readback
   cuts the next CUDA split's copy-in from 14.2 to 3.5 ms per graph.
@@ -106,6 +113,40 @@ Measured:
 - Box B with the same stack, CUDA banks only (RTX 6000, Vulkan switches off, rows placement, no-host weights,
   inplace-follow), V4.1: n4 11.88 against 10.58 for the previous package (+12 %), n0 9.72 against 8.75 (+11 %), and
   prefill +25 %. Prompt 0 is identical; prompts 1-2 drift after 850 and 244 characters. The draft acceptance is 0.90.
+
+### Ornith-1.5-35B-A3B on Box A: every routed expert on the two old GPUs
+
+The banks pay off when they hold whole layers, so that no layer needs a CPU expert split. Ornith-1.5-35B-A3B Q4_K_M
+(`ornith-ai/Ornith-1.5-35B-A3B-GGUF`) has 40 main MoE layers of about 0.42-0.49 GiB of experts each. A heat file
+generated from the GGUF tensor sizes lists all 256 experts of every layer. It fills the MI25 with whole layers within
+a 14 GiB budget (30 layers, about 13.6 GiB), and the third column puts the other 10 layers on the 1080 Ti (about
+4.6 GiB). The engine reports 10240 banked experts in 40 layers, 18.2 GiB on the two GPUs. Attention, the
+dense and shared weights, KV and the head stay on the 1080 Ti (`-ngl 99 --cpu-moe`). The host copy of the experts
+remains in place (row-placed over 8 NUMA nodes), and prefill uses it.
+
+Conditions: Box A, one load per arm, `-t 64 -cr 0-63`, `-c 8192`, `-ub 1024`, f16 KV, `--no-mmap`, weights never
+pinned. The workload is 3 coding-agent prompts (about 1.5-2.2k tokens) x 300 tokens, greedy, raw `/completion`.
+`m3` and `m2` are the model's native MTP head drafting 3 or 2 tokens (`--spec-type mtp:n_max=3,p_min=0.75`).
+`n0` = no draft. Watts are the median at the wall for the whole box.
+
+| arm | layout | decode tok/s | prefill | wall |
+|---|---|---|---|---|
+| o1 | experts on the CPU (rows over 8 nodes) | n0 41.99 | 370 | 542 W |
+| o2 | every expert in GPU banks: MI25 + 1080 Ti | n0 44.62 (+6 %) | 368 | 484 W |
+| o5 | o1 + MTP | m3 47.34, m2 46.96 (accept 85 %) | 320 | 598 W |
+| **o6** | **o2 + MTP** | **m3 59.13, m2 60.01, n0 44.59 (accept 85 %)** | 331 | 508 W |
+
+- o6 VRAM: 8.3 GB of the 1080 Ti's 11 GB. The MI25 ran at its high DPM state, with junction and HBM peaks of 59 and
+  57 C.
+- The same o6 layout serving chat requests at the model card's sampling (0.6 / 0.95 / top-k 20, thinking budget 8192,
+  `-c 32768`) decoded 45.7-53.3 tok/s at 13-21k tokens of depth, with 85.7 % MTP acceptance and 318-354 tok/s prefill.
+- MTP keeps the experts of its own layer (`blk.40`) on the device, so that layer must not appear in the heat file.
+  Otherwise the load aborts with "already device-resident".
+- The external DFlash draft for this model is accepted at only 1-6 % in this engine (o1: 0.9 %), which points to a
+  bug in the DFlash path. We have not investigated it. Use MTP.
+- For comparison on the same box: gpt-oss-120b MXFP4 with experts on the CPU decodes 31.0 tok/s (34.6 with expert
+  layers 0-2 on the 1080 Ti via `-ot`). The banks cannot hold gpt-oss experts yet, because the bank partitions and the
+  Vulkan fused MoE op do not handle expert biases or `SWIGLU_OAI`.
 
 ## Older patches (in every branch)
 
