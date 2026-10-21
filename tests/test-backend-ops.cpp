@@ -2837,8 +2837,56 @@ static int test_hotbank_required(bool cpu_only, bool full, const char * backend_
     return passed == cases.size() && executed_cases == cases.size() && !cases.empty() ? 0 : 1;
 }
 
+// --hotbank-perf BACKEND: time the V4.1 hot-bank work as the server graph runs it, one graph per call (lowering, submit
+// and wait included): up/gate + down over a bank of HOTBANK_PERF_EXPERTS (default 20) experts, k 5120, m 2304, 6 ids
+// per token with the inactive pattern of the required controls (4 of 6 active at one token)
+static int test_hotbank_perf(const char * backend_name) {
+    ggml_backend_t backend = nullptr;
+    for (size_t i = 0; i < ggml_backend_reg_get_count(); ++i) {
+        if (!strcmp(backend_name, ggml_backend_reg_get_name(i))) { backend = ggml_backend_reg_init_backend(i, nullptr); break; }
+    }
+    if (!backend) { fprintf(stderr, "perf backend absent: %s\n", backend_name); return 1; }
+    const int experts = getenv("HOTBANK_PERF_EXPERTS") ? atoi(getenv("HOTBANK_PERF_EXPERTS")) : 20;
+    const int runs = getenv("HOTBANK_PERF_RUNS") ? atoi(getenv("HOTBANK_PERF_RUNS")) : 30;
+    using T = test_hotbank;
+    for (auto q : {GGML_TYPE_MXFP4, GGML_TYPE_Q8_0}) {
+        for (int n : {1, 5}) {
+            for (auto kind : {T::chain, T::routed}) {
+                T c(kind, q, 5120, 2304, n, experts, false, false, true);
+                ggml_init_params params = { ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(8192, false), NULL, true };
+                ggml_context * ctx = ggml_init(params);
+                ggml_tensor * out = c.build_graph(ctx);
+                const char * name = kind == T::chain ? "chain" : "routed";
+                if (!ggml_backend_supports_op(backend, out)) {
+                    printf("HOTBANK perf %s %s tokens=%d: not supported\n", name, ggml_type_name(q), n);
+                    ggml_free(ctx);
+                    continue;
+                }
+                ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+                c.initialize_tensors(ctx);
+                ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
+                ggml_build_forward_expand(gf, out);
+                ggml_backend_graph_compute(backend, gf);
+                ggml_backend_synchronize(backend);
+                const int64_t t0 = ggml_time_us();
+                for (int i = 0; i < runs; ++i) {
+                    ggml_backend_graph_compute(backend, gf);
+                    ggml_backend_synchronize(backend);
+                }
+                printf("HOTBANK perf %s %s tokens=%d experts=%d nodes=%d: %.1f us/graph\n", name, ggml_type_name(q), n, experts,
+                       gf->n_nodes, (ggml_time_us() - t0) / double(runs));
+                ggml_backend_buffer_free(buf);
+                ggml_free(ctx);
+            }
+        }
+    }
+    ggml_backend_free(backend);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     if (argc == 2 && !strcmp(argv[1], "--hotbank-cpu")) { return test_hotbank_required(true, false, "CPU"); }
+    if (argc == 3 && !strcmp(argv[1], "--hotbank-perf")) { return test_hotbank_perf(argv[2]); }
     if (argc == 3 && (!strcmp(argv[1], "--hotbank-required") || !strcmp(argv[1], "--hotbank-v41"))) {
         return test_hotbank_required(false, !strcmp(argv[1], "--hotbank-v41"), argv[2]);
     }
