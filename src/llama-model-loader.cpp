@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-expert-place.h"
 #include "ggml.h"
 #include <memory>
 #include "ggml-backend.h"
@@ -1308,13 +1309,17 @@ bool llama_model_loader::load_all_data(
                         throw std::runtime_error(format("unable to allocate repack buffer for tensor '%s'", ggml_get_name(cur)));
                     }
                     uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(owned);
+                    ggml_backend_tensor_alloc(owned, cur, base);
+                    ggml_backend_buffer_set_usage(owned, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    // bind the fresh pages to their LLAMA_EXPERT_PLACEMENT nodes before the read faults them in, so the
+                    // load never fills a node with another node's pages (droopy 10-21: first touch under the process
+                    // interleave left a DRAM node full and the after-load migration crawled or OOM-killed the load)
+                    llama_expert_numa_prebind(*model, cur);
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(base, n_size);
                     if (check_tensors && !ggml_validate_row_data(cur->type, base, n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                     }
-                    ggml_backend_tensor_alloc(owned, cur, base);
-                    ggml_backend_buffer_set_usage(owned, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                     model->bufs.push_back(owned);
                     return n_size;
                 }
