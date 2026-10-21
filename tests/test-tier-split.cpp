@@ -76,6 +76,10 @@ int child(int nth) {
             if (ggml_graph_compute_with_ctx(ctx, gf, nth) != GGML_STATUS_SUCCESS) { printf("compute failed\n"); return 1; }
             printf("T%d step%d par %016" PRIx64 " out %016" PRIx64 "\n", T, step, fnv(par->data, ggml_nbytes(par)), fnv(out->data, ggml_nbytes(out)));
             std::this_thread::sleep_for(std::chrono::milliseconds(50)); // the copy threads fill the ring between steps
+            if (getenv("TEST_FORGET")) {
+                // the up weight's buffer "is freed": copies out of it end, its slots and map go; the next step maps it again
+                ggml_tier_forget(up->data, ggml_nbytes(up));
+            }
         }
     }
     uint64_t c[7] = {0};
@@ -143,6 +147,7 @@ int main(int argc, char ** argv) {
         { "real node (move_pages)",   grp + " GGML_TIER_SPLIT=2 GGML_TIER_PREFETCH=1 GGML_TIER_RING_MIB=2 " + node, 1, SLOW | HITS },
         { "fake addr range",          grp + " GGML_TIER_SPLIT=2 GGML_TIER_PREFETCH=1 TEST_FAKE_ADDR_UP=1",   1, SLOW | HITS },
         { "split off, slow nodes set",grp + " " + node,                                                       1, NONE },
+        { "forget up every step",     grp + " GGML_TIER_SPLIT=2 GGML_TIER_PREFETCH=1 GGML_TIER_PREFETCH_WHEN=now GGML_TIER_RING_MIB=1 TEST_FORGET=1 " + fake, 1, SLOW | HITS },
         { "ctl file toggles",         grp + " GGML_TIER_CTL=/tmp/test-tier-ctl-" + std::to_string(getpid()) + " GGML_TIER_CTL_MS=0 TEST_CTL_FILE=/tmp/test-tier-ctl-" + std::to_string(getpid()) + " " + fake, 1, SLOW | HITS },
     };
     std::vector<result> ref(2);

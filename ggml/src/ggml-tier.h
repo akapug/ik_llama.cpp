@@ -66,6 +66,10 @@ void ggml_tier_op_begin(const struct ggml_tensor * w0, const struct ggml_tensor 
 // the calling thread's CPU graph compute ended (all workers joined): unpin its ring slots, start its copy requests
 void ggml_tier_graph_end(void);
 
+// a host buffer [base, base + size) is about to be freed: wait for copies out of it, drop its requests, ring slots and
+// tier maps (ggml_backend_buffer_free calls it for host buffers)
+void ggml_tier_forget(const void * base, size_t size);
+
 // counters for tests: [0] ops with a slow expert, [1] fast experts used, [2] slow experts used, [3] ring hits,
 // [4] ring misses, [5] copies, [6] dropped requests
 void ggml_tier_counts(uint64_t out[7]);

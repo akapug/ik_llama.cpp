@@ -220,6 +220,7 @@ struct counters {
 struct tier_state {
     std::mutex mu;
     std::condition_variable cv;
+    std::condition_variable cv_done;   // a copy finished (ggml_tier_forget waits for copies out of a freed range)
     std::unordered_map<const void *, std::unique_ptr<weight>> ws;
     size_t n_slow_experts = 0, n_experts = 0, slow_bytes = 0, unknown_pages = 0;
     char * ring = nullptr;
@@ -419,6 +420,7 @@ struct tier_state {
             x.used = ++clock;
             n.copies++;
             n.copied += len;
+            cv_done.notify_all();
         }
     }
 
@@ -584,4 +586,33 @@ void ggml_tier_counts(uint64_t out[7]) {
     std::lock_guard<std::mutex> lock(s.mu);
     const uint64_t v[7] = { s.n.ops, s.n.used_fast, s.n.used_slow, s.n.hits, s.n.misses, s.n.copies, s.n.dropped };
     memcpy(out, v, sizeof(v));
+}
+
+void ggml_tier_forget(const void * base, size_t size) {
+    if (!cfg().on || !base || !size) return;
+    tier_state & s = st();
+    std::unique_lock<std::mutex> lock(s.mu);
+    const uintptr_t a = (uintptr_t) base, b = a + size;
+    auto in = [&](const weight * w) { return w && (uintptr_t) w->base >= a && (uintptr_t) w->base < b; };
+    s.cv_done.wait(lock, [&] {
+        for (const auto & x : s.slots) if (x.state == SLOT_COPYING && in(x.w)) return false;
+        return true;
+    });
+    auto drop = [&](std::deque<std::pair<weight *, int>> & q) {
+        q.erase(std::remove_if(q.begin(), q.end(), [&](const std::pair<weight *, int> & r) { return in(r.first); }), q.end());
+    };
+    drop(s.pending);
+    drop(s.queue);
+    for (auto & x : s.slots) if (x.state != SLOT_FREE && in(x.w)) x = slot();
+    for (auto it = s.ws.begin(); it != s.ws.end();) {
+        if (in(it->second.get())) {
+            s.n_slow_experts -= it->second->n_slow;
+            s.n_experts -= it->second->n;
+            s.slow_bytes -= (size_t) it->second->n_slow * it->second->nb2;
+            it = s.ws.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto & kv : s.ws) if (kv.second->pair && in(kv.second->pair)) kv.second->pair = nullptr;
 }
