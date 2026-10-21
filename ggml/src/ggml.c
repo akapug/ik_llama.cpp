@@ -13,6 +13,7 @@
 #include "ggml.h"
 #include "ggml-aarch64.h"
 #include "ggml-moe-prefetch.h"
+#include "ggml-tier.h"
 #include "iqk/iqk_quantize.h"
 #include "iqk/iqk_cpu_ops.h"
 #if GGML_USE_IQK_MULMAT
@@ -3069,6 +3070,9 @@ struct ggml_compute_state_shared {
     int serial_next; // GGML_SERIAL_SMALL: first node after the run thread 0 just computed alone
 
     atomic_int group_chunk[GGML_MOE_MAX_GROUPS]; // GGML_MOE_GROUPS: next chunk per thread group
+
+    atomic_int group_chunk_slow[GGML_MOE_MAX_GROUPS]; // GGML_TIER_SPLIT: next chunk of the slow-tier list per group
+    struct ggml_tier_op tier_op; // GGML_TIER_*: the current routed-expert op's tiers and read pointers (thread 0 writes)
 };
 
 struct ggml_compute_state {
@@ -18717,6 +18721,11 @@ static int ggml_compute_forward_mul_mat(
     return node_n;
 }
 
+// GGML_TIER_PREFETCH: expert a of weight w (0 = src0, 1 = the fused op's gate) is read from a DRAM ring copy when one is ready
+static inline const char * ggml_tier_src(const struct ggml_tier_op * op, int w, const struct ggml_tensor * t, int a, size_t nb02) {
+    return op->src[w] ? op->src[w][a] : (const char *) t->data + a*nb02;
+}
+
 // GGML_MOE_GROUPS: thread group g of G takes chunks of the experts with rows, C chunks per expert, from its own counter.
 // Chunk c of group g is chunk g*C + c of G*C equal row slices, so group g covers the rows its threads own in the
 // static split (up to one slice of rounding), which keeps first-touch NUMA placement local.
@@ -18724,13 +18733,19 @@ struct ggml_moe_group_iter {
     int g, G, C;
     bool skip; // GGML_MAIN_NO_MOE: this is thread 0 and its group has other threads to take its chunks
     int last_a, last_acc; // fetch_add values only grow per thread, so the expert walk resumes where it stopped
+    // GGML_TIER_SPLIT: two chunk lists per group (fast tier 0, slow tier 1); same chunks, only the order and the taker change
+    const uint8_t * slow; // [n_as] expert tier; NULL = one list
+    int tier;             // the list this thread takes chunks from
+    int left;             // lists this thread still visits (2 = steal from the other list when its own runs dry)
+    int t_last_a[2], t_last_acc[2];
 };
 
 static bool ggml_moe_group_init(const struct ggml_compute_params * params, struct ggml_moe_group_iter * it) {
-    if (g_cpu_knobs.moe_groups < 1 || params->nth < 2) {
+    const uint8_t * slow = params->shared->tier_op.slow;
+    if ((g_cpu_knobs.moe_groups < 1 && !slow) || params->nth < 2) {
         return false;
     }
-    const int G = MIN(g_cpu_knobs.moe_groups, params->nth);
+    const int G = MIN(MAX(g_cpu_knobs.moe_groups, 1), params->nth);
     it->G = G;
     it->g = params->ith * G / params->nth;
     // default: G*C == nth, i.e. exactly the static split's row slices (a free thread takes a late one's whole slice).
@@ -18740,6 +18755,18 @@ static bool ggml_moe_group_init(const struct ggml_compute_params * params, struc
     it->last_a = 0;
     it->last_acc = 0;
     it->skip = g_cpu_knobs.main_no_moe && params->ith == 0 && (params->nth + G - 1) / G >= 2;
+    it->slow = slow;
+    if (slow) {
+        // group g = threads [first, next); its last S threads start on the slow list (thread 0, a skipped one, is first)
+        const int first  = (it->g*params->nth + G - 1) / G;
+        const int next   = ((it->g + 1)*params->nth + G - 1) / G;
+        const int active = next - first - (first == 0 && g_cpu_knobs.main_no_moe && next - first >= 2 ? 1 : 0);
+        const int S = ggml_tier_split(it->g);
+        it->tier = params->ith >= next - S ? 1 : 0;
+        it->left = ggml_tier_steal() || S < 1 || S >= active ? 2 : 1;
+        it->t_last_a[0] = it->t_last_a[1] = 0;
+        it->t_last_acc[0] = it->t_last_acc[1] = 0;
+    }
     return true;
 }
 
@@ -18751,6 +18778,29 @@ static inline int ggml_moe_src1_ith(int ith, int nth) {
 
 static bool ggml_moe_group_next(struct ggml_compute_state_shared * shared, struct ggml_moe_group_iter * it,
         const int64_t * counts, int n_as, int * cur_a, int * chunk, int * n_chunks) {
+    if (it->slow) {
+        while (it->left > 0) {
+            const int t = it->tier;
+            const int k = atomic_fetch_add(t ? &shared->group_chunk_slow[it->g] : &shared->group_chunk[it->g], 1);
+            int acc = it->t_last_acc[t];
+            for (int a = it->t_last_a[t]; a < n_as; a++) {
+                if (counts[a] == 0 || it->slow[a] != t) continue;
+                if (k < acc + it->C) {
+                    it->t_last_a[t] = a;
+                    it->t_last_acc[t] = acc;
+                    *cur_a = a;
+                    *chunk = it->g*it->C + (k - acc);
+                    *n_chunks = it->G*it->C;
+                    return true;
+                }
+                acc += it->C;
+            }
+            // this list has no chunk left (its counter only grows): go to the other one
+            it->left--;
+            it->tier ^= 1;
+        }
+        return false;
+    }
     const int k = atomic_fetch_add(&shared->group_chunk[it->g], 1);
     int acc = it->last_acc;
     for (int a = it->last_a; a < n_as; a++) {
@@ -18864,6 +18914,7 @@ static void ggml_compute_forward_mul_mat_id(
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
         for (int g = 0; g < GGML_MOE_MAX_GROUPS; ++g) {
             atomic_store(&params->shared->group_chunk[g], 0); // GGML_MOE_GROUPS; read only after the barrier below
+            atomic_store(&params->shared->group_chunk_slow[g], 0);
         }
 
         // group rows by src0 matrix
@@ -18877,6 +18928,9 @@ static void ggml_compute_forward_mul_mat_id(
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
             }
+        }
+        if (ggml_tier_on()) {
+            ggml_tier_op_begin(src0, NULL, matrix_row_counts, n_as, &params->shared->tier_op);
         }
     }
 
@@ -18913,7 +18967,7 @@ static void ggml_compute_forward_mul_mat_id(
                 acc += chunks_per_expert;
             }
 
-            const char * src0_cur = (const char *) src0->data + cur_a*nb02;
+            const char * src0_cur = ggml_tier_src(&params->shared->tier_op, 0, src0, cur_a, nb02);
 
             if (!iqk_mul_mat_moe(ne01, matrix_row_counts[cur_a], ne00, ne11,
                         src0->type, src0_cur, nb01,
@@ -18941,7 +18995,7 @@ IQK_MulMat_Not_Available0:;
             int cur_a, chunk, n_chunks;
             while (!git.skip && ggml_moe_group_next(params->shared, &git, matrix_row_counts, n_as, &cur_a, &chunk, &n_chunks)) {
                 if (!iqk_mul_mat_moe(ne01, matrix_row_counts[cur_a], ne00, ne11,
-                            src0->type, (const char *) src0->data + cur_a*nb02, nb01,
+                            src0->type, ggml_tier_src(&params->shared->tier_op, 0, src0, cur_a, nb02), nb01,
                             vec_dot_type, (const char *)wdata_mm, row_size_mm,
                             (float *)dst->data, nb1, nb2,
                             matrix_rows + cur_a*ne12, chunk, n_chunks)) {
@@ -18962,7 +19016,7 @@ IQK_MulMat_Not_Available0:;
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a*nb02;
+        const char * src0_cur = ggml_tier_src(&params->shared->tier_op, 0, src0, cur_a, nb02);
 
         const void * wdata    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
@@ -19215,6 +19269,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
         for (int g = 0; g < GGML_MOE_MAX_GROUPS; ++g) {
             atomic_store(&params->shared->group_chunk[g], 0); // GGML_MOE_GROUPS; read only after the barrier below
+            atomic_store(&params->shared->group_chunk_slow[g], 0);
         }
 
         // group rows by src0 matrix
@@ -19228,6 +19283,9 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
             }
+        }
+        if (ggml_tier_on()) {
+            ggml_tier_op_begin(src0_1, src0_2, matrix_row_counts, n_as, &params->shared->tier_op);
         }
     }
 
@@ -19274,12 +19332,12 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
 
         const char *src0_1_cur, *src0_2_cur, *up_b_cur = NULL, *gate_b_cur = NULL;
         if (src0_2) {
-            src0_1_cur = (const char *) src0_1->data + cur_a*nb02;
-            src0_2_cur = (const char *) src0_2->data + cur_a*nb02;
+            src0_1_cur = ggml_tier_src(&params->shared->tier_op, 0, src0_1, cur_a, nb02);
+            src0_2_cur = ggml_tier_src(&params->shared->tier_op, 1, src0_2, cur_a, nb02);
             up_b_cur   = up_b   ? (const char *)up_b->data + cur_a*nb41 : NULL;
             gate_b_cur = gate_b ? (const char *)gate_b->data + cur_a*nb51 : NULL;
         } else {
-            src0_2_cur = (const char *) src0_1->data + cur_a*nb02;
+            src0_2_cur = ggml_tier_src(&params->shared->tier_op, 0, src0_1, cur_a, nb02);
             src0_1_cur = src0_2_cur + nb02/2;
             if (up_b) {
                 GGML_ASSERT(!gate_b);
@@ -19326,12 +19384,12 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
 
         const char *src0_1_cur, *src0_2_cur, *up_b_cur = NULL, *gate_b_cur = NULL;
         if (src0_2) {
-            src0_1_cur = (const char *) src0_1->data + cur_a*nb02;
-            src0_2_cur = (const char *) src0_2->data + cur_a*nb02;
+            src0_1_cur = ggml_tier_src(&params->shared->tier_op, 0, src0_1, cur_a, nb02);
+            src0_2_cur = ggml_tier_src(&params->shared->tier_op, 1, src0_2, cur_a, nb02);
             up_b_cur   = up_b   ? (const char *)up_b->data + cur_a*nb41 : NULL;
             gate_b_cur = gate_b ? (const char *)gate_b->data + cur_a*nb51 : NULL;
         } else {
-            src0_2_cur = (const char *) src0_1->data + cur_a*nb02;
+            src0_2_cur = ggml_tier_src(&params->shared->tier_op, 0, src0_1, cur_a, nb02);
             src0_1_cur = src0_2_cur + nb02/2;
             if (up_b) {
                 GGML_ASSERT(!gate_b);
@@ -30247,6 +30305,10 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
+
+    if (ggml_tier_on()) {
+        ggml_tier_graph_end();
+    }
 
     if (knobs->stats > 0) {
         ggml_cpu_stats_call(ggml_cpu_stats_ns() - t_call, n_threads);
