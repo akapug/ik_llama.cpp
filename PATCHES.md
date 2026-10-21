@@ -119,8 +119,8 @@ Measured:
 The banks pay off when they hold whole layers, so that no layer needs a CPU expert split. Ornith-1.5-35B-A3B Q4_K_M
 (`ornith-ai/Ornith-1.5-35B-A3B-GGUF`) has 40 main MoE layers of about 0.42-0.49 GiB of experts each. A heat file
 generated from the GGUF tensor sizes lists all 256 experts of every layer. It fills the MI25 with whole layers within
-a 14 GiB budget (30 layers, about 13.6 GiB), and the third column puts the other 10 layers on the 1080 Ti (about
-4.6 GiB). The engine reports 10240 banked experts in 40 layers, 18.2 GiB on the two GPUs. Attention, the
+a 14 GiB budget (30 layers, 13.49 GiB), and the third column puts the other 10 layers on the 1080 Ti (4.67
+GiB). The engine reports 10240 banked experts in 40 layers, 18.2 GiB on the two GPUs. Attention, the
 dense and shared weights, KV and the head stay on the 1080 Ti (`-ngl 99 --cpu-moe`). The host copy of the experts
 remains in place (row-placed over 8 NUMA nodes), and prefill uses it.
 
@@ -136,7 +136,7 @@ pinned. The workload is 3 coding-agent prompts (about 1.5-2.2k tokens) x 300 tok
 | o5 | o1 + MTP | m3 47.34, m2 46.96 (accept 85 %) | 320 | 598 W |
 | **o6** | **o2 + MTP** | **m3 59.13, m2 60.01, n0 44.59 (accept 85 %)** | 331 | 508 W |
 
-- o6 VRAM: 8.3 GB of the 1080 Ti's 11 GB. The MI25 ran at its high DPM state, with junction and HBM peaks of 59 and
+- o6 1080 Ti memory in use: 8,315 of 11,264 MiB. The MI25 ran at its high DPM state, with junction and HBM peaks of 59 and
   57 C.
 - The same o6 layout serving chat requests at the model card's sampling (0.6 / 0.95 / top-k 20, thinking budget 8192,
   `-c 32768`) decoded 45.7-53.3 tok/s at 13-21k tokens of depth, with 85.7 % MTP acceptance and 318-354 tok/s prefill.
