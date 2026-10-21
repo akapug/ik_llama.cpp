@@ -20,8 +20,9 @@ struct memory_device {
     ggml_backend backend {};
     ggml_backend_t cpu;
     ggml_guid guid {};
+    const char * name;
 
-    explicit memory_device(ggml_backend_t cpu, uint8_t identity) : cpu(cpu) {
+    explicit memory_device(ggml_backend_t cpu, uint8_t identity, const char * name = "synthetic-device") : cpu(cpu), name(name) {
         guid[0] = identity;
         buft.context = this;
         buft.iface.get_name = [](ggml_backend_buffer_type_t) { return "synthetic-device-storage"; };
@@ -47,7 +48,7 @@ struct memory_device {
         };
         backend.guid = &guid;
         backend.context = this;
-        backend.iface.get_name = [](ggml_backend_t) { return "synthetic-device"; };
+        backend.iface.get_name = [](ggml_backend_t b) { return (const char *) ((memory_device *) b->context)->name; };
         backend.iface.get_default_buffer_type = [](ggml_backend_t b) { return &((memory_device *) b->context)->buft; };
         backend.iface.supports_buft = [](ggml_backend_t b, ggml_backend_buffer_type_t bt) {
             return bt == &((memory_device *) b->context)->buft;
@@ -184,11 +185,57 @@ static void mixed_controls(const char * path, bool request_device) {
     printf("real hot-bank consumer: %s PASS\n", request_device ? "requested nonhost ID refused" : "mixed-source copy, preserved maps, exactly-once global IDs");
 }
 
+// A layer whose every expert is banked: the heat file's third column picks the bank device over
+// LLAMA_HOT_EXPERTS_DEVICE, and the small-batch path has no host rest partition (it would compute zero rows).
+static void whole_layer_controls(const char * path) {
+    std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> cpu(ggml_backend_cpu_init(), ggml_backend_free);
+    memory_device dev_a(cpu.get(), 103, "synthetic-a"), dev_b(cpu.get(), 104, "synthetic-b");
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> host_ctx(ggml_init({16 * ggml_tensor_overhead(), nullptr, true}), ggml_free);
+    llama_model model;
+    model.hparams.n_expert = 16;
+    model.layers.resize(2);
+    for (int il = 0; il < 2; ++il) {
+        llama_layer::expert_part p {};
+        p.up = ggml_new_tensor_3d(host_ctx.get(), GGML_TYPE_F32, 32, 32, 16);
+        p.gate = ggml_new_tensor_3d(host_ctx.get(), GGML_TYPE_F32, 32, 32, 16);
+        p.down = ggml_new_tensor_3d(host_ctx.get(), GGML_TYPE_F32, 32, 32, 16);
+        for (auto * t : {p.up, p.gate, p.down}) ggml_format_name(t, "synthetic-whole-%d", il);
+        model.layers[il].ffn_exps_parts.push_back(p);
+        model.layers[il].ffn_exps_part_map.resize(32);
+        for (int e = 0; e < 16; ++e) model.layers[il].ffn_exps_part_map[16 + e] = e;
+    }
+    std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> host_buf(
+        ggml_backend_alloc_ctx_tensors_from_buft(host_ctx.get(), ggml_backend_cpu_buffer_type()), ggml_backend_buffer_free);
+    require(bool(host_buf), "synthetic allocation failed");
+    ggml_backend_buffer_set_usage(host_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    // layer 0: every expert, column names synthetic-b; layer 1: two experts, no column (env device synthetic-a)
+    { std::ofstream file(path); require(bool(file), "cannot create synthetic heat file");
+      file << "blk.0\t0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15\tsynthetic-b\nblk.1\t3,7\n"; }
+    setenv("LLAMA_HOT_EXPERTS", path, 1);
+    setenv("LLAMA_HOT_EXPERTS_DEVICE", "synthetic-a", 1);
+    unsetenv("LLAMA_HOT_EXPERTS_MAX_BATCH");
+    auto parts = llama_hot_experts::create(model, {&dev_a.backend, &dev_b.backend, cpu.get()},
+            {&dev_a.buft, &dev_b.buft, ggml_backend_cpu_buffer_type()}, true);
+    require(bool(parts), "real consumer produced no partition context");
+    const auto * whole = parts->layer(0, 1);
+    require(whole && whole->size() == 1 && (*whole)[0].bank && (*whole)[0].backend == &dev_b.backend,
+            "whole-layer bank must be the only small-batch partition, on the column's device");
+    const auto * whole_large = parts->layer(0, 9);
+    require(whole_large && whole_large->size() == 1 && !(*whole_large)[0].bank, "large batches keep the host partition");
+    const auto * some = parts->layer(1, 1);
+    require(some && some->size() == 2, "a partial bank keeps its host rest partition");
+    for (const auto & p : *some) require(!p.bank || p.backend == &dev_a.backend, "a line without a column uses LLAMA_HOT_EXPERTS_DEVICE");
+    unsetenv("LLAMA_HOT_EXPERTS");
+    unsetenv("LLAMA_HOT_EXPERTS_DEVICE");
+    printf("real hot-bank consumer: per-layer device column, no rest partition for a whole-layer bank PASS\n");
+}
+
 int main(int argc, char ** argv) {
     try {
-        require(argc == 3, "usage: test-expert-banks mixed|nonhost SYNTHETIC_HEAT_PATH");
+        require(argc == 3, "usage: test-expert-banks mixed|nonhost|whole SYNTHETIC_HEAT_PATH");
         planner_controls();
-        require(!strcmp(argv[1], "mixed") || !strcmp(argv[1], "nonhost"), "unknown control");
+        require(!strcmp(argv[1], "mixed") || !strcmp(argv[1], "nonhost") || !strcmp(argv[1], "whole"), "unknown control");
+        if (!strcmp(argv[1], "whole")) { whole_layer_controls(argv[2]); return 0; }
         mixed_controls(argv[2], !strcmp(argv[1], "nonhost"));
         return 0;
     } catch (const std::exception & e) {
