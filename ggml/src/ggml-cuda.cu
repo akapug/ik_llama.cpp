@@ -1017,6 +1017,7 @@ GGML_CALL static void ggml_backend_cuda_split_buffer_set_tensor([[maybe_unused]]
         { GGML_TYPE_Q8_KV_R8  , 4},
         { GGML_TYPE_Q8_K_R8   , 8},
         { GGML_TYPE_IQ4_KS_R16, 16},
+        { GGML_TYPE_IQ5_KS_R16, 16},
     };
 
     // split tensors must always be set in their entirety at once
@@ -2843,9 +2844,10 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
         }
     }
 
-    // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
+    // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_q
+    // (mul_mat_vec_q does not read past the end of a row).
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
-    // Therefore, in such cases use cuBLAS.
+    // Therefore, in such cases use cuBLAS instead of mul_mat_q.
     const size_t src0_nbytes = ggml_nbytes(src0);
     const size_t src0_alloc  = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
     const bool   src0_padded = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
@@ -2857,7 +2859,7 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     bool use_dequantize_mul_mat_vec = ggml_cuda_dmmv_type_supported(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src0->ne[0] % (GGML_CUDA_DMMV_X*2) == 0 && src1->ne[1] == 1;
-    bool          use_mul_mat_vec_q =  ggml_is_quantized(src0->type) && !bad_padding_clear
+    bool          use_mul_mat_vec_q =  ggml_is_quantized(src0->type)
         && ggml_cuda_mmvq_type_supported(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src1->ne[1] <= ggml_cuda_mmvq_max_batch_size(cc);
@@ -2876,7 +2878,7 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     if ((use_mul_mat_vec_q || use_mul_mat_q) && src1->ne[2]*src1->ne[3] == 1) {
         // This return does not go through ggml_cuda_op_mul_mat, which is where the padding is otherwise cleared.
-        if (src0_padded) {
+        if (src0_padded && !use_mul_mat_vec_q) {
             CUDA_CHECK(cudaMemsetAsync((char *) src0->data + src0_nbytes, 0, src0_alloc - src0_nbytes, ctx.stream()));
         }
         return ggml_cuda_mul_mat_q(ctx, src0, src1, dst, cgraph, node_n, use_mul_mat_vec_q);
@@ -3126,6 +3128,7 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     src0_row.ne[2] = 1;
     src0_row.ne[3] = 1;
     src0_row.nb[3] = nb02;
+    src0_row.view_src = dst->src[0];
 
     src1_row.ne[1] = 1;
     src1_row.ne[2] = 1;
@@ -3531,10 +3534,12 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
     src0_1_row.ne[2] = 1;
     src0_1_row.ne[3] = 1;
     src0_1_row.nb[3] = nb02;
+    src0_1_row.view_src = dst->src[0];
     if (src0_2) {
         src0_2_row.ne[2] = 1;
         src0_2_row.ne[3] = 1;
         src0_2_row.nb[3] = nb02;
+        src0_2_row.view_src = dst->src[1];
     }
 
     src1_row.ne[1] = 1;
@@ -3549,15 +3554,22 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
     dst_row.nb[2] = nb1;
     dst_row.nb[3] = nb1;
 
-    bool fuse_down = false;
-    if (next && next->op == GGML_OP_MUL_MAT_ID) {
-        fuse_down = true;
+    bool fuse_down = next && next->op == GGML_OP_MUL_MAT_ID;
+    // The down result of an expert is written to next before the up/gate data of the remaining experts is read.
+    // If the up/gate experts are copies of host tensors, next may have been allocated on top of them.
+    for (int j = 0; fuse_down && j < GGML_MAX_SRC; ++j) {
+        auto src = dst->src[j];
+        fuse_down = !src || (const char *)src->data >= (const char *)next->data + ggml_nbytes(next) ||
+                            (const char *)next->data >= (const char *)src->data + ggml_nbytes(src);
+    }
+    if (fuse_down) {
         final_dst = *next;
         final_dst.ne[1] = final_dst.ne[2] = final_dst.ne[3] = 1;
         final_dst.nb[2] = final_dst.nb[3] = final_dst.nb[1];
         final_src = *next->src[0];
         final_src.ne[2] = final_src.ne[3] = 1;
         final_src.nb[3] = final_src.nb[2];
+        final_src.view_src = next->src[0];
     }
 
     ggml_cuda_pool_alloc<char> src1_quantized(ctx.pool());
@@ -3584,12 +3596,6 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
         dst_up_contiguous.alloc(2*sizeof(float)*ggml_nelements(dst));
         dst_gate_contiguous.alloc(sizeof(float)*ggml_nelements(dst));
     }
-    ggml_cuda_pool_alloc<char> final_dst_contiguous(ctx.pool());
-    if (fuse_down) {
-        final_dst.data = final_dst_contiguous.alloc(ggml_nelements(next));
-        final_dst.src[1] = &dst_row;
-    }
-
     src1_row.data = src1_contiguous.get();
 
     ggml_cuda_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool());
@@ -3602,6 +3608,13 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
         } else {
             CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
         }
+    }
+
+    ggml_cuda_pool_alloc<char> final_dst_contiguous(ctx.pool());
+    if (fuse_down) {
+        const int max_rows = *std::max_element(moe_counts.begin(), moe_counts.end());
+        final_dst.data = final_dst_contiguous.alloc(sizeof(float)*next->ne[0]*max_rows);
+        final_dst.src[1] = &dst_row;
     }
 
     for (int64_t i02 = 0; i02 < n_as; i02++) {
@@ -5358,6 +5371,7 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                     case GGML_TYPE_IQ6_K:
                     case GGML_TYPE_IQ1_BN:
                     case GGML_TYPE_IQ2_BN:
+                    case GGML_TYPE_PQ2_0:
                     case GGML_TYPE_IQ2_K_R4:
                     case GGML_TYPE_IQ3_K_R4:
                     case GGML_TYPE_IQ4_K_R4:
@@ -5368,6 +5382,7 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                     case GGML_TYPE_IQ1_M_R4:
                     case GGML_TYPE_IQ3_KS_R16:
                     case GGML_TYPE_IQ4_KS_R16:
+                    case GGML_TYPE_IQ5_KS_R16:
                         return true;
                     default:
                         return false;
@@ -5467,7 +5482,8 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
         case GGML_OP_ARGMAX:
             return true;
         case GGML_OP_HADAMARD: {
-            if (!(op->op_params[0] == 64 || op->op_params[0] == 128 || op->op_params[0] == 256 || op->op_params[0] == 512)) return false;
+            if (!(op->op_params[0] == 64 || op->op_params[0] == 128 || op->op_params[0] == 256 || op->op_params[0] == 512 ||
+                  op->op_params[0] == 1024 || op->op_params[0] == 2048 || op->op_params[0] == 4096)) return false;
             if (op->ne[0] % op->op_params[0] != 0) return false;
             if (op->type != GGML_TYPE_F32) return false;
             switch (op->src[0]->type) {
