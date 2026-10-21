@@ -196,6 +196,7 @@ static void whole_layer_controls(const char * path) {
     model.layers.resize(2);
     for (int il = 0; il < 2; ++il) {
         llama_layer::expert_part p {};
+        p.tag = 0;
         p.up = ggml_new_tensor_3d(host_ctx.get(), GGML_TYPE_F32, 32, 32, 16);
         p.gate = ggml_new_tensor_3d(host_ctx.get(), GGML_TYPE_F32, 32, 32, 16);
         p.down = ggml_new_tensor_3d(host_ctx.get(), GGML_TYPE_F32, 32, 32, 16);
