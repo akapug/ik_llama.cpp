@@ -198,13 +198,13 @@ long sys_move_pages(unsigned long count, void ** pages, int * status) {
 
 } // namespace
 
-void llama_expert_numa_apply(const llama_model & model, bool use_mmap) {
-    const char * path = getenv("LLAMA_EXPERT_PLACEMENT");
-    if (!path || !*path) return;
-    if (use_mmap) {
-        LLAMA_LOG_WARN("%s: LLAMA_EXPERT_PLACEMENT needs --no-mmap (file-backed pages ignore mbind); placement skipped\n", __func__);
-        return;
-    }
+namespace {
+
+struct plan_counts { size_t tensors = 0, dense = 0, skipped = 0; };
+
+// the placement plan of the model's host weights (only == nullptr) or of one tensor (only != nullptr: the loader binds a
+// freshly allocated, not yet read buffer, so no warning for tensors that are not host weights yet)
+numa_plan build_plan(const llama_model & model, const char * path, const ggml_tensor * only, plan_counts & cnt) {
     std::ifstream in(path);
     if (!in) throw std::runtime_error(std::string("cannot read LLAMA_EXPERT_PLACEMENT file ") + path);
 
@@ -212,7 +212,6 @@ void llama_expert_numa_apply(const llama_model & model, bool use_mmap) {
 #ifdef __linux__
     plan.page = (size_t) sysconf(_SC_PAGESIZE);
 #endif
-    const bool strict = getenv("LLAMA_EXPERT_PLACEMENT_STRICT") && atoi(getenv("LLAMA_EXPERT_PLACEMENT_STRICT"));
 
     // a key is a layer ("blk.N" / "N"), an exact tensor name, or "re:<ECMAScript regex>" searched in tensor names
     struct rule { std::string key; int layer; std::string experts; int policy; int line; std::shared_ptr<std::regex> re; };
@@ -234,7 +233,6 @@ void llama_expert_numa_apply(const llama_model & model, bool use_mmap) {
     plan.intended.assign(plan.policies.size(), 0);
 
     const size_t page = plan.page;
-    const unsigned long maxnode = k_max_nodes;
     // bind one tensor: pol[i] = policy of its i-th block of nb2 bytes (an expert, or a group of a grouped dense weight);
     // a rows policy splits each block's bytes in order over its nodes
     auto place = [&](ggml_tensor * t, const std::vector<int> & pol, size_t nb2) {
@@ -284,12 +282,13 @@ void llama_expert_numa_apply(const llama_model & model, bool use_mmap) {
         flush(p1);
     };
 
-    size_t n_tensors = 0, n_skipped = 0;
+    size_t & n_tensors = cnt.tensors, & n_skipped = cnt.skipped, & n_dense = cnt.dense;
     std::unordered_set<const ggml_tensor *> seen;   // expert tensors: placed by the loop below or left alone
     for (size_t il = 0; il < model.layers.size(); ++il) {
         for (const auto & lt : layer_expert_tensors(model.layers[il])) {
             ggml_tensor * t = lt.t;
             seen.insert(t);
+            if (only && t != only) continue;
             std::vector<const rule *> mine;
             for (const auto & r : rules) {
                 if (r.layer == (int) il || (r.layer < 0 && names(r, t->name))) mine.push_back(&r);
@@ -323,9 +322,8 @@ void llama_expert_numa_apply(const llama_model & model, bool use_mmap) {
     // field is "*" (the tensor is one block) or "/G" (G equal consecutive blocks, e.g. the DeepSeek-V4 grouped
     // attn_output_a, whose grouped matmul gives each group's rows to every node's threads); with -cr in node order and the
     // static row split of a dense matmul, node k's threads then read slice k of every block
-    size_t n_dense = 0;
     for (const auto & [name, t] : model.tensors_by_name) {
-        if (seen.count(t)) continue;
+        if (seen.count(t) || (only && t != only)) continue;
         const rule * r = nullptr;
         for (const auto & x : rules) if (x.layer < 0 && names(x, name.c_str())) r = &x;   // the last matching rule wins
         if (!r) continue;
@@ -339,6 +337,45 @@ void llama_expert_numa_apply(const llama_model & model, bool use_mmap) {
         if (g < 1 || ggml_nbytes(t) % g) throw std::runtime_error(where + ": a non-expert tensor takes \"*\" or \"/G\" (G dividing its bytes): " + name);
         ++n_dense;
         place(t, std::vector<int>(g, r->policy), ggml_nbytes(t) / g);
+    }
+
+    return plan;
+}
+
+size_t g_prebound = 0, g_prebound_tensors = 0;   // bytes / tensors bound by llama_expert_numa_prebind before their read
+
+} // namespace
+
+void llama_expert_numa_prebind(const llama_model & model, const ggml_tensor * t) {
+    const char * path = getenv("LLAMA_EXPERT_PLACEMENT");
+    if (!path || !*path || (getenv("LLAMA_EXPERT_PREBIND") && !atoi(getenv("LLAMA_EXPERT_PREBIND")))) return;
+    plan_counts cnt;
+    const numa_plan plan = build_plan(model, path, t, cnt);
+    for (const auto & r : plan.ranges) {
+        const numa_policy & np = plan.policies[r.policy];
+        unsigned long mask[k_max_nodes / (8 * sizeof(unsigned long))] = {};
+        for (int n : np.nodes) mask[n / (8 * sizeof(unsigned long))] |= 1ul << (n % (8 * sizeof(unsigned long)));
+        if (sys_mbind(r.addr, r.len, np.mode, mask, k_max_nodes, 0) == 0) g_prebound += r.len;   // no MOVE: nothing faulted yet
+    }
+    g_prebound_tensors += plan.ranges.empty() ? 0 : 1;
+}
+
+void llama_expert_numa_apply(const llama_model & model, bool use_mmap) {
+    const char * path = getenv("LLAMA_EXPERT_PLACEMENT");
+    if (!path || !*path) return;
+    if (use_mmap) {
+        LLAMA_LOG_WARN("%s: LLAMA_EXPERT_PLACEMENT needs --no-mmap (file-backed pages ignore mbind); placement skipped\n", __func__);
+        return;
+    }
+    const bool strict = getenv("LLAMA_EXPERT_PLACEMENT_STRICT") && atoi(getenv("LLAMA_EXPERT_PLACEMENT_STRICT"));
+    plan_counts cnt;
+    numa_plan plan = build_plan(model, path, nullptr, cnt);
+    const size_t n_tensors = cnt.tensors, n_dense = cnt.dense, n_skipped = cnt.skipped;
+    const unsigned long maxnode = k_max_nodes;
+    if (g_prebound) {
+        LLAMA_LOG_INFO("%s: %zu tensors were bound before their read (%.1f MiB; LLAMA_EXPERT_PREBIND=0 turns this off)\n",
+                __func__, g_prebound_tensors, g_prebound / 1048576.0);
+        g_prebound = g_prebound_tensors = 0;
     }
 
     // bind (and migrate, for pages already faulted in) the policy with the highest node first: on this platform the
