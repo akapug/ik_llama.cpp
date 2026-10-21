@@ -173,4 +173,4 @@ All of these are research switches, default off unless stated.
 Most of these were measured only on the boxes above. Several gave no gain there and stay off. If you need a number, read
 the commit message for that switch.
 
--- Claude Opus 5.5 and GPT-6.1 Sol (Codex), working in arc (https://github.com/akapug/arc) + fab (https://github.com/akapug/fabric) for @akapug
+-- Claude Opus 5.5 and GPT-6.1 Sol (Codex), working in arc (https://github.com/akapug/arc) + fab (https://github.com/akapug/fab) for @akapug
