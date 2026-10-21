@@ -64,6 +64,7 @@ struct config {
     bool prefetch = false;
     size_t ring_mib = 1024;
     std::vector<int> ring_nodes;
+    bool ring_bind = false;   // GGML_TIER_RING_POLICY: bind (OOM when the node is full) or preferred (falls back)
     int pf_threads = 1;
     std::vector<int> pf_cpus;
     bool release_at_end = true;
@@ -155,6 +156,7 @@ config read_config() {
     }
     c.prefetch = (e = env("GGML_TIER_PREFETCH")) ? atoi(e) != 0 : false;
     c.ring_mib = (e = env("GGML_TIER_RING_MIB")) ? (size_t) std::max(0ll, atoll(e)) : 1024;
+    c.ring_bind = (e = env("GGML_TIER_RING_POLICY")) && strcmp(e, "bind") == 0;
     c.pf_threads = (e = env("GGML_TIER_PREFETCH_THREADS")) ? std::max(1, atoi(e)) : 1;
     c.pf_cpus = parse_list(env("GGML_TIER_PREFETCH_CPUS"));
     c.release_at_end = !((e = env("GGML_TIER_PREFETCH_WHEN")) && strcmp(e, "now") == 0);
@@ -173,10 +175,10 @@ config read_config() {
     e = env("GGML_TIER_RING_NODES");
     c.ring_nodes = e ? (strcmp(e, "-") == 0 ? std::vector<int>() : parse_list(e)) : with_cpus;
     if (c.ring_nodes.size() < 2 && !e) c.ring_nodes.clear();
-    fprintf(stderr, "ggml tier: GGML_TIER_SPLIT=%s steal=%d slow nodes=%s samples=%d fake=%s prefetch=%d ring=%zu MiB nodes=%s "
+    fprintf(stderr, "ggml tier: GGML_TIER_SPLIT=%s steal=%d slow nodes=%s samples=%d fake=%s prefetch=%d ring=%zu MiB nodes=%s %s "
             "threads=%d cpus=%s when=%s stats=%ld ctl=%s\n", join(c.split).c_str(), c.steal ? 1 : 0, join(c.slow_nodes).c_str(), c.samples,
             !c.fake_experts.empty() ? "experts" : c.fake_b > c.fake_a ? "addr" : "-", c.prefetch ? 1 : 0, c.ring_mib,
-            join(c.ring_nodes).c_str(), c.pf_threads, join(c.pf_cpus).c_str(), c.release_at_end ? "end" : "now", c.stats, c.ctl.empty() ? "-" : c.ctl.c_str());
+            join(c.ring_nodes).c_str(), c.ring_bind ? "bind" : "preferred", c.pf_threads, join(c.pf_cpus).c_str(), c.release_at_end ? "end" : "now", c.stats, c.ctl.empty() ? "-" : c.ctl.c_str());
     return c;
 }
 
@@ -333,14 +335,29 @@ struct tier_state {
                     const int node = c.ring_nodes[k];
                     if (node < 0 || node >= 1024) continue;
                     mask[node / (8*sizeof(unsigned long))] |= 1ul << (node % (8*sizeof(unsigned long)));
-                    if (syscall(SYS_mbind, (char *) p + s*slot_bytes + k*part, part, 2 /* MPOL_BIND */, mask, 1024, 0) != 0) bound_fail++;
+                    const int mode = c.ring_bind ? 2 /* MPOL_BIND */ : 1 /* MPOL_PREFERRED */;
+                    if (syscall(SYS_mbind, (char *) p + s*slot_bytes + k*part, part, mode, mask, 1024, 0) != 0) bound_fail++;
                 }
             }
         }
+        // fault the ring in now (one page write each) and read where its pages landed
+        std::vector<void *> pages;
+        for (size_t off = 0; off < n_slots * slot_bytes; off += page) {
+            ((volatile char *) p)[off] = 0;
+            if (off % (64*page) == 0) pages.push_back((char *) p + off);
+        }
+        std::vector<int> status(pages.size(), -1);
+        syscall(SYS_move_pages, 0, pages.size(), pages.data(), nullptr, status.data(), 0);
+        std::string where;
+        for (int node = 0; node < 64; ++node) {
+            const long cnt = std::count(status.begin(), status.end(), node);
+            if (cnt) where += " n" + std::to_string(node) + " " + std::to_string(cnt * 100 / (long) status.size()) + "%";
+        }
         ring = (char *) p;
         slots.assign(n_slots, slot());
-        fprintf(stderr, "ggml tier: ring %zu slots x %.2f MiB = %.1f MiB, parts on nodes %s (%zu bind failures)\n", n_slots,
-                slot_bytes / 1048576.0, n_slots * slot_bytes / 1048576.0, join(c.ring_nodes).c_str(), bound_fail);
+        fprintf(stderr, "ggml tier: ring %zu slots x %.2f MiB = %.1f MiB, parts on nodes %s (%s, %zu mbind failures); pages:%s\n",
+                n_slots, slot_bytes / 1048576.0, n_slots * slot_bytes / 1048576.0, join(c.ring_nodes).c_str(),
+                c.ring_bind ? "bind" : "preferred", bound_fail, where.c_str());
         return true;
 #else
         ring_failed = true;
