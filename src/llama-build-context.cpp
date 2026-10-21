@@ -1834,8 +1834,16 @@ llm_expert_gating_func_type   gating_op,
         std::vector<const llama_hot_experts::part *> order;
         for (const auto & p : *parts) if (!bank_first || p.bank) order.push_back(&p);
         if (bank_first) for (const auto & p : *parts) if (!p.bank) order.push_back(&p);
+        // With LLAMA_HOT_BANK_FIRST every partition output is expanded in order, so the bank nodes really precede the
+        // CPU cold-expert nodes in the graph (an unexpanded bank output was only pulled in by the final sum, after the
+        // cold experts: the device split then ran after the CPU split). The side work goes first in that mode, so it
+        // joins the device split before the experts instead of opening one between them.
         ggml_backend_t pin = nullptr;
         bool side_done = !overlap;
+        if (bank_first && !side_done) {
+            expand_side();
+            side_done = true;
+        }
         for (const auto * pp : order) {
             const auto & p = *pp;
             if (p.bank && !side_done) {
@@ -1843,7 +1851,7 @@ llm_expert_gating_func_type   gating_op,
                 side_done = true;
             }
             ggml_tensor * out = path(p, std::string(p.bank ? "bank_" : "") + p.tag);
-            if (overlap && !p.bank) ggml_build_forward_expand(graph, out);
+            if (graph && (bank_first || (overlap && !p.bank))) ggml_build_forward_expand(graph, out);
             if (p.bank) pin = p.backend;
             experts = experts ? ggml_add(ctx, experts, out) : out;
         }
