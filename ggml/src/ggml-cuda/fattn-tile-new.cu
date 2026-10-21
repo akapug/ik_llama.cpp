@@ -398,6 +398,7 @@ static __global__ void flash_attn_tile_new(
         const char * __restrict__ K,
         const char * __restrict__ V,
         const char * __restrict__ mask,
+        const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
@@ -511,6 +512,27 @@ static __global__ void flash_attn_tile_new(
 #pragma unroll
     for (int jc0 = 0; jc0 < cpw; ++jc0) {
         KQ_sum[jc0] = warp_reduce_sum(KQ_sum[jc0]);
+    }
+
+    // Attention sinks (DeepSeek V4, gpt-oss): one extra per-head softmax logit with no value row. Only the first KV
+    // block (blockIdx.y == 0) adds it, so the parallel_blocks combine counts it once; KQ_max and the reduced KQ_sum are
+    // warp-uniform here, so every lane applies the same update.
+    if (sinks && blockIdx.y == 0) {
+        const float * sinksf = (const float *) sinks;
+#pragma unroll
+        for (int jc0 = 0; jc0 < cpw; ++jc0) {
+            const int jc = jc0 + (threadIdx.y/np)*cpw;
+            const float sink = sinksf[head0 + jc % ncols2];
+            const float KQ_max_new = fmaxf(KQ_max[jc0], sink);
+            const float KQ_max_scale = expf(KQ_max[jc0] - KQ_max_new);
+            KQ_max[jc0] = KQ_max_new;
+            KQ_sum[jc0] = KQ_sum[jc0]*KQ_max_scale + expf(sink - KQ_max_new);
+#pragma unroll
+            for (int i0 = 0; i0 < (DVp/2)/warp_size; ++i0) {
+                VKQ[jc0*((DVp/2)/warp_size) + i0].x *= KQ_max_scale;
+                VKQ[jc0*((DVp/2)/warp_size) + i0].y *= KQ_max_scale;
+            }
+        }
     }
 
     // Write back results:
@@ -779,6 +801,7 @@ static void launch_fattn_tile_new(ggml_backend_cuda_context & ctx, ggml_tensor *
         K_data,
         V_data,
         (const char *) mask->data,
+        dst->src[4] ? (const char *) dst->src[4]->data : nullptr,
         KV_max.get(),
         parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, 0.0f, 1.0f, 1.0f, 0.0f, 1u,
@@ -848,7 +871,13 @@ bool ggml_cuda_fattn_tile_new_is_supported(ggml_backend_cuda_context & ctx, cons
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
     // Only the variants that pack 4 or 8 Q heads per K/V head are compiled. Everything else stays on the CPU.
-    if (K->ne[0] != 512 || V->ne[0] != 512 || !mask || sinks || max_bias != 0.0f || logit_softcap != 0.0f) {
+    // Sinks (an F32 logit per Q head) are applied after the KV loop (DeepSeek V4's attention, LLAMA_FA_TILE_NEW_SINKS=0
+    // keeps such ops on the CPU as before).
+    static const bool sinks_on = !getenv("LLAMA_FA_TILE_NEW_SINKS") || atoi(getenv("LLAMA_FA_TILE_NEW_SINKS")) != 0;
+    if (sinks && (!sinks_on || sinks->type != GGML_TYPE_F32 || sinks->ne[0] < Q->ne[2])) {
+        return false;
+    }
+    if (K->ne[0] != 512 || V->ne[0] != 512 || !mask || max_bias != 0.0f || logit_softcap != 0.0f) {
         return false;
     }
     if (K->ne[1] % FATTN_KQ_STRIDE != 0 || Q->ne[3] != 1 || Q->ne[2] % K->ne[2] != 0 || (Q->ne[2] / K->ne[2]) % 4 != 0) {
