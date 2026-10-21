@@ -535,6 +535,7 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
     const int n_exp = (int) model.hparams.n_expert;
 
     std::map<int, std::vector<int>> hot;
+    std::map<int, std::string> hot_dev;  // optional third column: the backend that holds this layer's bank (e.g. CUDA0)
     if (path) {
         std::ifstream in(path);
         if (!in) throw std::runtime_error(std::string("cannot read LLAMA_HOT_EXPERTS file ") + path);
@@ -545,8 +546,8 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
             line = trim(line);
             if (line.empty()) continue;
             std::stringstream ss(line);
-            std::string key, ids;
-            ss >> key >> ids;
+            std::string key, ids, dev;
+            ss >> key >> ids >> dev;
             const int il = parse_layer_key(key);
             if (il >= (int) model.layers.size() && !ids.empty()) {
                 // the file names a layer this model lacks: it was written for another model (e.g. the target, while this
@@ -570,6 +571,7 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
             }
             auto & v = hot[il];
             v.insert(v.end(), parsed.begin(), parsed.end());
+            if (!dev.empty()) hot_dev[il] = dev;
         }
         if (hot.empty()) path = nullptr;
         if (!split && !path) return nullptr;
@@ -673,8 +675,11 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
                 const auto * buft = model.default_buffer_type_offload(model.default_layer_device[il]);
                 for (size_t i = 0; i < bufts.size(); ++i) if (bufts[i] == buft && !ggml_backend_is_cpu(backends[i])) device = (int) i;
             }
-            // LLAMA_HOT_EXPERTS_DEVICE=<backend name> (e.g. Vulkan0): the banks go to that device, not the layer's
-            if (const char * want_dev = getenv("LLAMA_HOT_EXPERTS_DEVICE"); want_dev && *want_dev) {
+            // LLAMA_HOT_EXPERTS_DEVICE=<backend name> (e.g. Vulkan0): the banks go to that device, not the layer's;
+            // a third column on the layer's line names the device for that layer only
+            const auto dit = hot_dev.find((int) il);
+            const char * env_dev = getenv("LLAMA_HOT_EXPERTS_DEVICE");
+            if (const char * want_dev = dit != hot_dev.end() ? dit->second.c_str() : env_dev; want_dev && *want_dev) {
                 device = -1;
                 for (size_t i = 0; i < backends.size(); ++i) if (strcmp(ggml_backend_name(backends[i]), want_dev) == 0) device = (int) i;
                 if (device < 0) throw std::runtime_error(std::string("hot experts: LLAMA_HOT_EXPERTS_DEVICE=") + want_dev + " names no backend");
@@ -713,6 +718,8 @@ std::unique_ptr<llama_hot_experts> llama_hot_experts::create(const llama_model &
             if (!want.empty()) {
                 std::vector<int32_t> v = s.local;
                 for (int e : s.banked) v[e] = -1;
+                // every expert of this source is banked: no rest path (it would only add a host split of zero rows)
+                if (std::all_of(v.begin(), v.end(), [](int32_t x) { return x < 0; })) continue;
                 part q = s.w;
                 q.backend = backends[b];
                 q.map = new_map(b, buft, std::move(v), "hot.rest", (int) il, s.w.tag);
