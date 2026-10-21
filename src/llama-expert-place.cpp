@@ -296,7 +296,7 @@ numa_plan build_plan(const llama_model & model, const char * path, const ggml_te
             if (mine.empty()) continue;
             if (!is_host_weight(t) || !expert_contiguous(t)) {
                 ++n_skipped;
-                LLAMA_LOG_WARN("%s: %s is not a host-resident expert-contiguous tensor; skipped\n", __func__, t->name);
+                if (!only) LLAMA_LOG_WARN("llama_expert_numa_apply: %s is not a host-resident expert-contiguous tensor; skipped\n", t->name);
                 continue;
             }
             const int n_exp = (int) t->ne[2];
@@ -329,7 +329,7 @@ numa_plan build_plan(const llama_model & model, const char * path, const ggml_te
         if (!r) continue;
         if (!is_host_weight(t) || !ggml_is_contiguous(t)) {
             ++n_skipped;
-            LLAMA_LOG_WARN("%s: %s is not a contiguous host weight; skipped\n", __func__, name.c_str());
+            if (!only) LLAMA_LOG_WARN("llama_expert_numa_apply: %s is not a contiguous host weight; skipped\n", name.c_str());
             continue;
         }
         const std::string where = std::string(path) + ":" + std::to_string(r->line);
