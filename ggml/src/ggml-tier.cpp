@@ -118,6 +118,17 @@ void scan_nodes(std::vector<int> & cpuless, std::vector<int> & with_cpus) {
 #endif
 }
 
+#if defined(__linux__)
+// the process CPU mask at static init, before any compute thread pins itself: the default mask of the copy threads
+// (they are started from a compute thread, whose pinned one-CPU mask they would inherit)
+struct initial_mask {
+    cpu_set_t set;
+    bool ok;
+    initial_mask() { CPU_ZERO(&set); ok = sched_getaffinity(0, sizeof(set), &set) == 0; }
+};
+const initial_mask g_initial_mask;
+#endif
+
 std::string join(const std::vector<int> & v) {
     std::string s;
     for (size_t i = 0; i < v.size(); ++i) s += (i ? "," : "") + std::to_string(v[i]);
@@ -340,12 +351,12 @@ struct tier_state {
     void copier() {
         const config & c = cfg();
 #if defined(__linux__)
+        cpu_set_t set = g_initial_mask.set;
         if (!c.pf_cpus.empty()) {
-            cpu_set_t set;
             CPU_ZERO(&set);
             for (int cpu : c.pf_cpus) if (cpu >= 0 && cpu < CPU_SETSIZE) CPU_SET(cpu, &set);
-            pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
         }
+        if (!c.pf_cpus.empty() || g_initial_mask.ok) pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 #endif
         std::unique_lock<std::mutex> lock(mu);
         while (true) {

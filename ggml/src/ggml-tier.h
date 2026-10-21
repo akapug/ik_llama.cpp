@@ -29,7 +29,8 @@
 //  GGML_TIER_RING_NODES=list    slot k-th part bound to the k-th node, like a rows:A,B placement (default: the NUMA
 //                               nodes with CPUs, ascending; one node = no binding); "-" = no binding
 //  GGML_TIER_PREFETCH_THREADS=N copy threads (default 1)
-//  GGML_TIER_PREFETCH_CPUS=list CPUs the copy threads run on (default: the process mask)
+//  GGML_TIER_PREFETCH_CPUS=list CPUs the copy threads run on (default: the process mask at start, not the pinned
+//                               mask of the compute thread that starts them)
 //  GGML_TIER_PREFETCH_WHEN=end  "end": a step's copy requests start when its CPU graph compute ends (default);
 //                               "now": at once, while the step still computes
 //  GGML_TIER_STATS=N            every N CPU graph computes (and at exit) print the counters
