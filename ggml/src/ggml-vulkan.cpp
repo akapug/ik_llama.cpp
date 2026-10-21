@@ -1080,11 +1080,32 @@ struct ggml_backend_vk_context {
     // device memory of the lowered fork MoE intermediates, kept across graphs (grown on demand) instead of a new
     // allocation per graph
     ggml_backend_buffer_t lower_buf {};
+
+    // GGML_VK_STAGED_INPUTS: host-visible staging for split inputs from other backends, filled from in_staging_off
+    // (reset by the graph cleanup); in_src_pending = source backends with reads still in flight
+    vk_buffer in_staging;
+    size_t in_staging_off {};
+    bool in_recorded {};
+    std::vector<ggml_backend_t> in_src_pending;
 };
 
 static bool ggml_vk_async_graph() {
     static const bool on = [] { const char * e = getenv("GGML_VK_ASYNC_GRAPH"); return e && atoi(e) != 0; }();
     return on;
+}
+
+// GGML_VK_STAGED_INPUTS=1 (default off): a split input from another backend is read into a host-visible staging
+// buffer and copied to the device inside the graph's first command buffer, instead of one blocking write (submit +
+// fence wait) per input. GGML_VK_STAGED_INPUTS_MIB sizes the staging buffer (default 64); an input that does not fit
+// takes the blocking path.
+static bool ggml_vk_staged_inputs() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_STAGED_INPUTS"); return e && atoi(e) != 0; }();
+    return on;
+}
+
+static size_t ggml_vk_staged_inputs_cap() {
+    static const size_t cap = size_t(getenv("GGML_VK_STAGED_INPUTS_MIB") ? atoll(getenv("GGML_VK_STAGED_INPUTS_MIB")) : 64) << 20;
+    return cap;
 }
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
@@ -9862,6 +9883,8 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
 
     ctx->tensor_ctxs.clear();
     ctx->gc.contexts.clear();
+    ctx->in_staging_off = 0;
+    ctx->in_recorded = false;
     ctx->pipeline_descriptor_set_requirements = 0;
     ctx->descriptor_set_idx = 0;
 }
@@ -9891,6 +9914,7 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
         ggml_backend_buffer_free(ctx->lower_buf);
         ctx->lower_buf = nullptr;
     }
+    ggml_vk_destroy_buffer(ctx->in_staging);
 
     ggml_vk_destroy_buffer(ctx->prealloc_x);
     ggml_vk_destroy_buffer(ctx->prealloc_y);
@@ -10231,32 +10255,53 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
     ggml_vk_buffer_read_async(transfer_ctx, buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
 }
 
-static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {
-    VK_LOG_DEBUG("ggml_backend_vk_cpy_tensor_async()");
-    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    if ((dst->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || dst->buffer->buft == ggml_backend_vk_host_buffer_type()) && ggml_backend_buffer_is_vk(src->buffer)) {
-        ggml_backend_vk_buffer_context * src_buf_ctx = (ggml_backend_vk_buffer_context *)src->buffer->context;
-        ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
-
-        vk_context transfer_ctx;
-
-        if (ctx->transfer_ctx.expired()) {
-            // Initialize new transfer context
-            transfer_ctx = ggml_vk_create_context(ctx, ctx->transfer_cmd_pool);
-            ctx->transfer_ctx = transfer_ctx;
-            ggml_vk_ctx_begin(ctx->device, transfer_ctx);
-        } else {
-            transfer_ctx = ctx->transfer_ctx.lock();
-        }
-
-        vk_buffer src_buf = src_buf_ctx->dev_buffer;
-        vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
-
-        ggml_vk_buffer_copy_async(transfer_ctx, dst_buf, vk_tensor_offset(dst) + dst->view_offs, src_buf, vk_tensor_offset(src) + src->view_offs, ggml_nbytes(src));
-        return true;
+// GGML_VK_STAGED_INPUTS: src (another backend's tensor) -> the staging buffer now (async on the source stream when
+// it can), staging -> dst recorded at the head of the next compute command buffer; graph_compute waits the sources
+// and adds the barrier before the first node. Anything else returns false (the caller's blocking copy).
+GGML_CALL static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend_dst->context;
+    if (!ggml_vk_staged_inputs() || vk_perf_logger_enabled || !ggml_backend_buffer_is_vk(dst->buffer) ||
+            ggml_backend_buffer_is_vk(src->buffer) || !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        return false;
     }
-
-    return false;
+    ggml_backend_vk_buffer_context * dst_ctx = (ggml_backend_vk_buffer_context *) dst->buffer->context;
+    const size_t n = ggml_nbytes(src);
+    const size_t off = GGML_PAD(ctx->in_staging_off, 256);
+    if (dst_ctx->dev_buffer->device != ctx->device || off + n > ggml_vk_staged_inputs_cap()) {
+        return false;
+    }
+    // a graph still in flight may read the staging buffer and owns the command pools
+    ggml_vk_finish_pending(ctx);
+    if (!ctx->in_staging) {
+        ctx->in_staging = ggml_vk_create_buffer_check(ctx->device, ggml_vk_staged_inputs_cap(),
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    }
+    void * p = (uint8_t *) ctx->in_staging->ptr + off;
+    if (ggml_backend_buffer_is_host(src->buffer)) {
+        memcpy(p, src->data, n);
+    } else if (backend_src->iface.get_tensor_async) {
+        ggml_backend_tensor_get_async(backend_src, src, p, 0, n);
+        if (std::find(ctx->in_src_pending.begin(), ctx->in_src_pending.end(), backend_src) == ctx->in_src_pending.end()) {
+            ctx->in_src_pending.push_back(backend_src);
+        }
+    } else {
+        ggml_backend_synchronize(backend_src);
+        ggml_backend_tensor_get(src, p, 0, n);
+    }
+    vk_context cctx;
+    if (ctx->compute_ctx.expired()) {
+        cctx = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
+        ctx->compute_ctx = cctx;
+        ggml_vk_ctx_begin(ctx->device, cctx);
+    } else {
+        cctx = ctx->compute_ctx.lock();
+    }
+    VkBufferCopy bc = { off, vk_tensor_offset(dst) + dst->view_offs, n };
+    vkCmdCopyBuffer(cctx->s->buffer, (VkBuffer) ctx->in_staging->buffer, (VkBuffer) dst_ctx->dev_buffer->buffer, 1, &bc);
+    ctx->in_staging_off = off + n;
+    ctx->in_recorded = true;
+    return true;
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
@@ -10430,6 +10475,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     ggml_vk_finish_pending(ctx);
+    // staged inputs: their source reads must land before the submit, and their copies before the first node
+    for (ggml_backend_t b : ctx->in_src_pending) {
+        ggml_backend_synchronize(b);
+    }
+    ctx->in_src_pending.clear();
+    if (ctx->in_recorded && !ctx->compute_ctx.expired()) {
+        vk_context c = ctx->compute_ctx.lock();
+        ggml_vk_sync_buffers(c);
+    }
 
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsLabelEXT dul = {};
@@ -10582,6 +10636,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->device->perf_logger->print_timings();
     }
 
+    if (ctx->in_recorded && !vk_perf_logger_enabled && !ctx->compute_ctx.expired()) {
+        // staged input copies but no node was enqueued: submit the copies alone
+        vk_context c = ctx->compute_ctx.lock();
+        ggml_vk_ctx_end(c);
+        ctx->compute_ctx.reset();
+        ggml_vk_submit(c, ctx->fence);
+        ggml_vk_wait_for_fence(ctx);
+    }
     if (!ctx->graph_pending) {
         ggml_vk_graph_cleanup(ctx);
     }
@@ -11005,7 +11067,7 @@ static ggml_backend_i ggml_backend_vk_interface = {
     /* .get_default_buffer_type = */ ggml_backend_vk_get_default_buffer_type,
     /* .set_tensor_async        = */ NULL,  // ggml_backend_vk_set_tensor_async,
     /* .get_tensor_async        = */ NULL,  // ggml_backend_vk_get_tensor_async,
-    /* .cpy_tensor_async        = */ NULL,  // ggml_backend_vk_cpy_tensor_async,
+    /* .cpy_tensor_async        = */ ggml_backend_vk_cpy_tensor_async,
     /* .synchronize             = */ ggml_backend_vk_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
