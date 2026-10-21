@@ -606,10 +606,7 @@ void ggml_tier_forget(const void * base, size_t size) {
     for (auto & x : s.slots) if (x.state != SLOT_FREE && in(x.w)) x = slot();
     for (auto it = s.ws.begin(); it != s.ws.end();) {
         if (in(it->second.get())) {
-            s.n_slow_experts -= it->second->n_slow;
-            s.n_experts -= it->second->n;
-            s.slow_bytes -= (size_t) it->second->n_slow * it->second->nb2;
-            it = s.ws.erase(it);
+            it = s.ws.erase(it);   // the map counters stay cumulative (what the run mapped), so the exit line keeps them
         } else {
             ++it;
         }
