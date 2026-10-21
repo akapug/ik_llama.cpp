@@ -1349,6 +1349,8 @@ add_library(ggml
             ggml-moe-prefetch.h
             ggml-tier.cpp
             ggml-tier.h
+            ggml-numa-experts.cpp
+            ggml-numa-experts.h
             ggml-quants.c
             ggml-quants.h
             ggml-utils.h

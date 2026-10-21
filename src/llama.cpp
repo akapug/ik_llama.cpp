@@ -5496,8 +5496,10 @@ static bool llm_load_tensors(
         // tensors are streamed into owned buffers while use_mmap stays on for the tables), the loader allocates the expert
         // buffers while it reads them, so there is nothing to bind yet: placement runs after the load and migrates the
         // pages instead (before the in-place repack below, which keeps them where they are)
+        // an mmap'ed model's tensors point into the mapping only after load_all_data: its placement (tmpfs copies only, see
+        // llama_expert_numa_apply) runs after the load too
         const bool place_after_load = ml.defer_copy_dense || (keep_ple_mapping && ml.repack_tensors);
-        if (!place_after_load) llama_expert_numa_apply(model, ml.use_mmap);
+        if (!place_after_load && !ml.use_mmap) llama_expert_numa_apply(model, false);
         for (auto & it : ctx_bufs) {
             ggml_context * ctx = it.first;
             auto & bufs = it.second;
@@ -5506,7 +5508,7 @@ static bool llm_load_tensors(
             }
         }
 
-        if (place_after_load) llama_expert_numa_apply(model, false);
+        if (place_after_load || ml.use_mmap) llama_expert_numa_apply(model, ml.use_mmap && !place_after_load);
         llama_expert_numa_report(model);
 
         if (defer_expert_mmap) {

@@ -4,6 +4,7 @@
 #include "llama-model.h"
 
 #include "ggml-cpp.h"
+#include "ggml-numa-experts.h"
 #include "iqk/iqk_quantize.h"
 
 #include <algorithm>
@@ -22,8 +23,14 @@
 #include <unordered_set>
 
 #ifdef __linux__
+#include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/vfs.h>
 #include <unistd.h>
+#endif
+
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
 #endif
 
 #ifndef MPOL_BIND
@@ -200,13 +207,73 @@ long sys_move_pages(unsigned long count, void ** pages, int * status) {
 
 namespace {
 
-struct plan_counts { size_t tensors = 0, dense = 0, skipped = 0; };
+struct plan_counts { size_t tensors = 0, dense = 0, skipped = 0, autos = 0; };
+
+// the placement source: a LLAMA_EXPERT_PLACEMENT file, GGML_NUMA_EXPERTS (auto plan), both, or neither (nullptr)
+const char * placement_path() {
+    const char * p = getenv("LLAMA_EXPERT_PLACEMENT");
+    return p && *p ? p : nullptr;
+}
+
+bool placement_on() {
+    return placement_path() || ggml_numa_experts_on();
+}
+
+// LLAMA_HOT_EXPERTS layer -> expert ids banked on a GPU (the same file llama_hot_experts reads; a bad line is left for
+// it to report)
+std::map<int, std::vector<int>> hot_ids() {
+    std::map<int, std::vector<int>> out;
+    const char * path = getenv("LLAMA_HOT_EXPERTS");
+    if (!path || !*path) return out;
+    std::ifstream in(path);
+    std::string line;
+    for (int ln = 1; std::getline(in, line); ++ln) {
+        const auto hash = line.find('#');
+        if (hash != std::string::npos) line = line.substr(0, hash);
+        std::stringstream ss(trim(line));
+        std::string key, ids;
+        ss >> key >> ids;
+        const int il = parse_layer_key(key);
+        if (il < 0 || ids.empty()) continue;
+        try {
+            const auto v = parse_ids(ids, INT_MAX, path);
+            out[il].insert(out[il].end(), v.begin(), v.end());
+        } catch (const std::exception &) {
+        }
+    }
+    return out;
+}
+
+// GGML_NUMA_EXPERTS auto plan: expert e of layer il goes whole to the node of group owner[e] of the id partition (salt
+// il, so the deal starts at a different id per layer); experts banked on a GPU (LLAMA_HOT_EXPERTS) are dealt after the
+// host ones, so the experts decode reads on the CPU stay balanced across the groups
+struct auto_plan {
+    std::vector<int> nodes;      // per group
+    std::vector<double> w;       // per group
+    std::vector<int> policy;     // per group: index of its node's bind policy
+    std::map<int, std::vector<int>> hot;
+    std::map<std::pair<int, int>, std::vector<int32_t>> owner;   // (layer, n_expert) -> owner group per expert
+
+    const std::vector<int32_t> & owners(int il, int n) {
+        auto it = owner.find({ il, n });
+        if (it != owner.end()) return it->second;
+        std::vector<uint8_t> skip(n, 0);
+        auto h = hot.find(il);
+        if (h != hot.end()) for (int e : h->second) if (e >= 0 && e < n) skip[e] = 1;
+        std::vector<int32_t> o(n, 0);
+        ggml_numa_experts_partition(n, skip.data(), w.data(), (int) nodes.size(), il, o.data());
+        return owner[{ il, n }] = std::move(o);
+    }
+};
 
 // the placement plan of the model's host weights (only == nullptr) or of one tensor (only != nullptr: the loader binds a
 // freshly allocated, not yet read buffer, so no warning for tensors that are not host weights yet)
 numa_plan build_plan(const llama_model & model, const char * path, const ggml_tensor * only, plan_counts & cnt) {
-    std::ifstream in(path);
-    if (!in) throw std::runtime_error(std::string("cannot read LLAMA_EXPERT_PLACEMENT file ") + path);
+    std::ifstream in;
+    if (path) {
+        in.open(path);
+        if (!in) throw std::runtime_error(std::string("cannot read LLAMA_EXPERT_PLACEMENT file ") + path);
+    }
 
     numa_plan plan;
 #ifdef __linux__
@@ -229,6 +296,16 @@ numa_plan build_plan(const llama_model & model, const char * path, const ggml_te
         if (f.size() != 3) throw std::runtime_error(std::string(path) + ":" + std::to_string(ln) + ": expected 3 fields (tensor-or-layer, experts, node)");
         auto re = f[0].rfind("re:", 0) == 0 ? std::make_shared<std::regex>(f[0].substr(3)) : nullptr;
         rules.push_back({ f[0], re ? -1 : parse_layer_key(f[0]), f[1], policy_index(plan, f[2]), ln, re });
+    }
+    std::unique_ptr<auto_plan> autop;
+    if (ggml_numa_experts_on()) {
+        autop = std::make_unique<auto_plan>();
+        autop->nodes.resize(ggml_numa_experts_groups(nullptr));
+        ggml_numa_experts_groups(autop->nodes.data());
+        autop->w.resize(autop->nodes.size());
+        ggml_numa_experts_weights(autop->w.data());
+        for (int n : autop->nodes) autop->policy.push_back(policy_index(plan, std::to_string(n)));
+        autop->hot = hot_ids();
     }
     plan.intended.assign(plan.policies.size(), 0);
 
@@ -293,15 +370,22 @@ numa_plan build_plan(const llama_model & model, const char * path, const ggml_te
             for (const auto & r : rules) {
                 if (r.layer == (int) il || (r.layer < 0 && names(r, t->name))) mine.push_back(&r);
             }
-            if (mine.empty()) continue;
+            if (mine.empty() && !autop) continue;
             if (!is_host_weight(t) || !expert_contiguous(t)) {
-                ++n_skipped;
-                if (!only) LLAMA_LOG_WARN("llama_expert_numa_apply: %s is not a host-resident expert-contiguous tensor; skipped\n", t->name);
+                // GPU-resident expert tensors (-ngl without --cpu-moe/-ot) are not the CPU's to shard: quiet for the auto plan
+                if (!mine.empty()) ++n_skipped;
+                if (!only && !mine.empty()) LLAMA_LOG_WARN("llama_expert_numa_apply: %s is not a host-resident expert-contiguous tensor; skipped\n", t->name);
                 continue;
             }
             const int n_exp = (int) t->ne[2];
             const size_t nb2 = t->nb[2];
             std::vector<int> pol(n_exp, -1);
+            if (mine.empty()) {
+                // GGML_NUMA_EXPERTS and no rule for this tensor: the auto plan (global ids; a split layer maps them)
+                const auto & o = autop->owners((int) il, (int) lt.local.size());
+                for (size_t e = 0; e < lt.local.size(); ++e) if (lt.local[e] >= 0) pol[lt.local[e]] = autop->policy[o[e]];
+                ++cnt.autos;
+            }
             for (const rule * r : mine) {
                 const std::string where = std::string(path) + ":" + std::to_string(r->line);
                 if (r->layer < 0) {
@@ -342,13 +426,59 @@ numa_plan build_plan(const llama_model & model, const char * path, const ggml_te
     return plan;
 }
 
+// an mmap'ed model: keep the planned ranges that lie in a mapping of a tmpfs or hugetlbfs file and fault their pages in
+// (MADV_POPULATE_READ, else a read per page). For such shared memory mbind sets the file's own policy and MPOL_MF_MOVE
+// migrates the pages this process maps (a page cache page of a disk file is reallocated by the process policy the next
+// time it is read, so disk mmaps are left alone). Returns false when no range is left.
+bool mmap_ranges(numa_plan & plan) {
+#ifdef __linux__
+    std::vector<std::pair<uintptr_t, uintptr_t>> shm;
+    std::map<std::string, bool> fs;   // path -> on tmpfs/hugetlbfs
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line)) {
+        std::stringstream ss(line);
+        std::string range, perms, off, dev, inode, file;
+        ss >> range >> perms >> off >> dev >> inode;
+        std::getline(ss, file);
+        file = trim(file);
+        if (file.empty() || file[0] != '/') continue;
+        auto it = fs.find(file);
+        if (it == fs.end()) {
+            struct statfs sf;
+            const bool shmem = statfs(file.c_str(), &sf) == 0 &&
+                ((unsigned long) sf.f_type == 0x01021994ul /* TMPFS_MAGIC */ || (unsigned long) sf.f_type == 0x958458f6ul /* HUGETLBFS_MAGIC */);
+            it = fs.emplace(file, shmem).first;
+        }
+        if (!it->second) continue;
+        const auto dash = range.find('-');
+        shm.push_back({ (uintptr_t) std::stoull(range.substr(0, dash), nullptr, 16), (uintptr_t) std::stoull(range.substr(dash + 1), nullptr, 16) });
+    }
+    std::vector<numa_range> keep;
+    for (const auto & r : plan.ranges) {
+        const uintptr_t a = (uintptr_t) r.addr, b = a + r.len;
+        if (!std::any_of(shm.begin(), shm.end(), [&](const auto & m) { return a >= m.first && b <= m.second; })) continue;
+        if (madvise(r.addr, r.len, MADV_POPULATE_READ) != 0) {
+            volatile char sink = 0;
+            for (size_t o = 0; o < r.len; o += plan.page) sink = sink + r.addr[o];
+        }
+        keep.push_back(r);
+    }
+    plan.ranges = std::move(keep);
+    return !plan.ranges.empty();
+#else
+    (void) plan;
+    return false;
+#endif
+}
+
 size_t g_prebound = 0, g_prebound_tensors = 0;   // bytes / tensors bound by llama_expert_numa_prebind before their read
 
 } // namespace
 
 void llama_expert_numa_prebind(const llama_model & model, const ggml_tensor * t) {
-    const char * path = getenv("LLAMA_EXPERT_PLACEMENT");
-    if (!path || !*path || (getenv("LLAMA_EXPERT_PREBIND") && !atoi(getenv("LLAMA_EXPERT_PREBIND")))) return;
+    const char * path = placement_path();
+    if (!placement_on() || (getenv("LLAMA_EXPERT_PREBIND") && !atoi(getenv("LLAMA_EXPERT_PREBIND")))) return;
     plan_counts cnt;
     const numa_plan plan = build_plan(model, path, t, cnt);
     for (const auto & r : plan.ranges) {
@@ -361,16 +491,18 @@ void llama_expert_numa_prebind(const llama_model & model, const ggml_tensor * t)
 }
 
 void llama_expert_numa_apply(const llama_model & model, bool use_mmap) {
-    const char * path = getenv("LLAMA_EXPERT_PLACEMENT");
-    if (!path || !*path) return;
-    if (use_mmap) {
-        LLAMA_LOG_WARN("%s: LLAMA_EXPERT_PLACEMENT needs --no-mmap (file-backed pages ignore mbind); placement skipped\n", __func__);
-        return;
-    }
+    if (!placement_on()) return;
+    const char * path = placement_path();
+    const char * what = path ? path : "GGML_NUMA_EXPERTS auto plan";
     const bool strict = getenv("LLAMA_EXPERT_PLACEMENT_STRICT") && atoi(getenv("LLAMA_EXPERT_PLACEMENT_STRICT"));
     plan_counts cnt;
     numa_plan plan = build_plan(model, path, nullptr, cnt);
     const size_t n_tensors = cnt.tensors, n_dense = cnt.dense, n_skipped = cnt.skipped;
+    if (use_mmap && !mmap_ranges(plan)) {
+        LLAMA_LOG_WARN("%s: %s: no planned range lies in a tmpfs/hugetlbfs mapping; a disk-file mmap ignores mbind, so placement "
+                "needs --no-mmap or a tmpfs model copy; placement skipped\n", __func__, what);
+        return;
+    }
     const unsigned long maxnode = k_max_nodes;
     if (g_prebound) {
         LLAMA_LOG_INFO("%s: %zu tensors were bound before their read (%.1f MiB; LLAMA_EXPERT_PREBIND=0 turns this off)\n",
@@ -402,8 +534,9 @@ void llama_expert_numa_apply(const llama_model & model, bool use_mmap) {
     }
     plan.ranges = std::move(placed);
 
-    LLAMA_LOG_INFO("%s: %s: %zu expert + %zu other tensors placed in %zu ranges (%zu skipped), %zu straddle pages, %.2f MiB left at tensor edges\n",
-            __func__, path, n_tensors, n_dense, plan.ranges.size(), n_skipped, plan.straddle_pages, plan.unplaced / 1048576.0);
+    LLAMA_LOG_INFO("%s: %s: %zu expert (%zu by the auto plan) + %zu other tensors placed in %zu ranges (%zu skipped), %zu straddle pages, %.2f MiB left at tensor edges%s\n",
+            __func__, what, n_tensors, cnt.autos, n_dense, plan.ranges.size(), n_skipped, plan.straddle_pages, plan.unplaced / 1048576.0,
+            use_mmap ? " (tmpfs mmap: pages populated, then moved)" : "");
     for (size_t i = 0; i < plan.policies.size(); ++i) {
         if (!plan.policies[i].parts.empty()) continue;   // a rows policy's bytes are counted under its parts
         LLAMA_LOG_INFO("%s:   node(s) %-8s %s %10.1f MiB\n", __func__, plan.policies[i].text.c_str(),
