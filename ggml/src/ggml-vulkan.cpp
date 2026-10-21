@@ -6274,8 +6274,30 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 
 static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst, bool dryrun = false) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id(" << src0 << ", " << src1 << ", " << src2 << ", " << dst << ")");
-    if (src2->ne[1] == 1 && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type))) {
+    // GGML_VK_MMVID_MAX_TOKENS (default 8, 0 = off): a batch of at most this many tokens runs the mat-vec kernel once per
+    // token. The tiled matmul_id path costs ~11 ms for a 5-token V4.1 bank chain on the MI25 (tokens=1: 0.42 ms), so a
+    // draft verify batch pays it on every layer.
+    static const uint32_t mmvid_max_tokens = getenv("GGML_VK_MMVID_MAX_TOKENS") ? atoi(getenv("GGML_VK_MMVID_MAX_TOKENS")) : 8;
+    const bool vec_ok = src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type);
+    if (src2->ne[1] == 1 && vec_ok) {
         ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, src0, src1, src2, dst, dryrun);
+    } else if (vec_ok && src2->ne[1] <= mmvid_max_tokens && ggml_vk_dim01_contiguous(src1)) {
+        for (int64_t t = 0; t < src2->ne[1]; ++t) {
+            ggml_tensor src1_copy = *src1;
+            ggml_tensor src2_copy = *src2;
+            ggml_tensor dst_copy = *dst;
+            src1_copy.view_offs = src1->view_offs + t * src1->nb[2];
+            src1_copy.ne[2] = 1;
+            src1_copy.nb[3] = src1_copy.nb[2];
+            src2_copy.view_offs = src2->view_offs + t * src2->nb[1];
+            src2_copy.ne[1] = 1;
+            src2_copy.nb[2] = src2_copy.nb[1];
+            src2_copy.nb[3] = src2_copy.nb[2] * src2_copy.ne[2];
+            dst_copy.view_offs = dst->view_offs + t * dst->nb[2];
+            dst_copy.ne[2] = 1;
+            dst_copy.nb[3] = dst_copy.nb[2];
+            ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, src0, &src1_copy, &src2_copy, &dst_copy, dryrun);
+        }
     } else {
         // Split based on number of ids, to fit in shared memory
         const uint32_t nei0 = (uint32_t)src2->ne[0];
