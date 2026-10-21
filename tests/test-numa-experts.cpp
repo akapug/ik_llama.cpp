@@ -30,6 +30,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -54,6 +55,32 @@ int node_of_heap() {
     std::vector<char> b(1 << 20, 1);
     const int n = node_of(b.data() + 4096);
     return n < 0 ? 0 : n;
+}
+
+// the kernel arms compare page owners against the parent's heap node, but each arm is a child process whose heap is
+// first-touched wherever the scheduler runs it, and with zone_reclaim_mode 0 a node short of free pages (a big page
+// cache) spills a local allocation to another node: on lassie (8 nodes) every expert then read as shared. Pin this
+// process (children inherit both) to the CPUs of its heap node and bind its memory there (move_pages in the placement
+// arms is not limited by the policy).
+void pin_to_node(int node) {
+    std::ifstream f("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist");
+    std::string s;
+    if (!std::getline(f, s)) return;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (size_t i = 0; i < s.size();) {
+        const size_t j = std::min(s.find(',', i), s.size());
+        const std::string part = s.substr(i, j - i);
+        const size_t dash = part.find('-');
+        const int a = std::atoi(part.c_str());
+        const int b = dash == std::string::npos ? a : std::atoi(part.c_str() + dash + 1);
+        for (int c = a; c <= b; ++c) CPU_SET(c, &set);
+        i = j + 1;
+    }
+    sched_setaffinity(0, sizeof(set), &set);
+    unsigned long mask[16] = {0};
+    if (node >= 0 && node < 1024) mask[node / 64] = 1ul << (node % 64);
+    syscall(SYS_set_mempolicy, 2 /* MPOL_BIND */, mask, 1024ul);
 }
 
 //
@@ -355,6 +382,7 @@ int main(int argc, char ** argv) {
     if (argc > 2 && strcmp(argv[1], "child") == 0) return child(atoi(argv[2]));
     if (argc > 2 && strcmp(argv[1], "place") == 0) return place(argv[2], argc > 3 && strcmp(argv[3], "mmap") == 0);
     const int nth = argc > 1 ? atoi(argv[1]) : 8;
+    pin_to_node(node_of_heap());
     const std::string h = std::to_string(node_of_heap());
     const std::string nodes = argc > 2 ? argv[2] : h + "," + h;
     char self[4096] = {0};
