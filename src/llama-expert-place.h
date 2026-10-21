@@ -47,6 +47,10 @@ constexpr int LLAMA_EXPERT_PART_MAX = 8;
 const char * llama_expert_part_tag(int tag);
 
 void llama_expert_numa_apply(const llama_model & model, bool use_mmap);
+// bind one freshly allocated host weight to its placement before the loader reads it (deferred --no-mmap loads, whose
+// buffers exist only during the read); llama_expert_numa_apply still runs after the load and finds the pages placed.
+// LLAMA_EXPERT_PREBIND=0 turns it off.
+void llama_expert_numa_prebind(const llama_model & model, const ggml_tensor * t);
 
 // whether a backend computes MUL_MAT_ID with weights of this type (a CPU backend always does)
 bool llama_backend_runs_expert_type(ggml_backend_t backend, ggml_type type);

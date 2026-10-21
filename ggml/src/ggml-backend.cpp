@@ -3,6 +3,7 @@
 #include "ggml-impl.h"
 #include "ggml-rpc.h"
 #include "ggml-moe-prefetch.h"
+#include "ggml-tier.h"
 
 #include <cassert>
 #include <climits>
@@ -139,6 +140,10 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
         return;
     }
 
+    if (ggml_tier_on() && buffer->size > 0 && ggml_backend_buffer_is_host(buffer)) {
+        // GGML_TIER_PREFETCH copy threads may still read weights of this buffer
+        ggml_tier_forget(ggml_backend_buffer_get_base(buffer), buffer->size);
+    }
     if (buffer->iface.free_buffer != NULL) {
         buffer->iface.free_buffer(buffer);
     }

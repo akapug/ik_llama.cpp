@@ -3,7 +3,9 @@
 // Needs a NUMA node other than node 0. Not in CMake; build against build-cuda:
 //   g++ -std=c++17 -Iinclude -Isrc -Iggml/include -Iggml/src tests/test-expert-place.cpp -o test-expert-place
 //       -Lbuild-cuda/src -Lbuild-cuda/ggml/src -lllama -lggml -Wl,-rpath,$PWD/build-cuda/src:$PWD/build-cuda/ggml/src
-//   ./test-expert-place <second-node>
+//   ./test-expert-place <second-node> [prebind]
+// prebind: bind each tensor with llama_expert_numa_prebind before the first touch (the deferred --no-mmap loader), then
+// run llama_expert_numa_apply after it, which must find every page already placed
 #include "llama-expert-place.h"
 #include "llama-model.h"
 
@@ -64,12 +66,17 @@ int main(int argc, char ** argv) {
     }
     setenv("LLAMA_EXPERT_PLACEMENT", path.c_str(), 1);
     setenv("LLAMA_EXPERT_PLACEMENT_VERIFY", "1", 1);
-    llama_expert_numa_apply(model, false);
+    const bool prebind = argc > 2 && !strcmp(argv[2], "prebind");
+    if (prebind) {
+        for (ggml_tensor * t : { up, down, qb, woa, norm }) llama_expert_numa_prebind(model, t);
+    } else {
+        llama_expert_numa_apply(model, false);
+    }
     memset(up->data, 1, ggml_nbytes(up));       // first touch after the policy, as the loader does
     memset(down->data, 1, ggml_nbytes(down));
     memset(qb->data, 1, ggml_nbytes(qb));
     memset(woa->data, 1, ggml_nbytes(woa));
-    llama_expert_numa_report(model);
+    if (!prebind) llama_expert_numa_report(model);   // prebind: the checks below run before any apply could migrate a page
 
     int bad = 0, checked = 0;
     for (ggml_tensor * t : { up, down }) {
@@ -107,7 +114,11 @@ int main(int argc, char ** argv) {
             }
         }
     }
-    printf("checked %d whole pages, %d misplaced\n", checked, bad);
+    if (prebind) {   // then the after-load apply, as the deferred loader does: it must find the pages placed
+        llama_expert_numa_apply(model, false);
+        llama_expert_numa_report(model);
+    }
+    printf("checked %d whole pages, %d misplaced%s\n", checked, bad, prebind ? " before the after-load apply" : "");
     model.layers[0].ffn_up_exps = model.layers[0].ffn_down_exps = nullptr;
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
