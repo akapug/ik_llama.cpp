@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -19,6 +20,7 @@
 
 #if defined(__linux__)
 #include <dirent.h>
+#include <sys/stat.h>
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
@@ -66,7 +68,32 @@ struct config {
     std::vector<int> pf_cpus;
     bool release_at_end = true;
     long stats = 0;
+    std::string ctl;      // GGML_TIER_CTL file: run-time split/steal/prefetch
+    int ctl_ms = 250;
 };
+
+// the run-time values (the environment's at start; GGML_TIER_CTL replaces them while the process runs)
+constexpr int k_max_groups = 8;   // = GGML_MOE_MAX_GROUPS
+struct runtime {
+    std::atomic<int> split[k_max_groups];
+    std::atomic<bool> split_any{false}, steal{true}, prefetch{false};
+};
+
+runtime & rt() {
+    static runtime r;
+    return r;
+}
+
+void set_split(const std::vector<int> & v) {
+    runtime & r = rt();
+    bool any = false;
+    for (int g = 0; g < k_max_groups; ++g) {
+        const int x = v.empty() ? 0 : std::max(0, v[std::min<size_t>((size_t) g, v.size() - 1)]);
+        r.split[g].store(x);
+        any = any || x > 0;
+    }
+    r.split_any.store(any);
+}
 
 // nodes with memory, split into CPU-less (slow default) and with CPUs (ring default)
 void scan_nodes(std::vector<int> & cpuless, std::vector<int> & with_cpus) {
@@ -121,7 +148,12 @@ config read_config() {
     c.pf_cpus = parse_list(env("GGML_TIER_PREFETCH_CPUS"));
     c.release_at_end = !((e = env("GGML_TIER_PREFETCH_WHEN")) && strcmp(e, "now") == 0);
     c.stats = (e = env("GGML_TIER_STATS")) ? atol(e) : 0;
-    c.on = !c.split.empty() || c.prefetch;
+    c.ctl = (e = env("GGML_TIER_CTL")) ? e : "";
+    c.ctl_ms = (e = env("GGML_TIER_CTL_MS")) ? std::max(0, atoi(e)) : 250;
+    c.on = !c.split.empty() || c.prefetch || !c.ctl.empty();
+    set_split(c.split);
+    rt().steal.store(c.steal);
+    rt().prefetch.store(c.prefetch);
     if (!c.on) return c;
 
     std::vector<int> cpuless, with_cpus;
@@ -131,9 +163,9 @@ config read_config() {
     c.ring_nodes = e ? (strcmp(e, "-") == 0 ? std::vector<int>() : parse_list(e)) : with_cpus;
     if (c.ring_nodes.size() < 2 && !e) c.ring_nodes.clear();
     fprintf(stderr, "ggml tier: GGML_TIER_SPLIT=%s steal=%d slow nodes=%s samples=%d fake=%s prefetch=%d ring=%zu MiB nodes=%s "
-            "threads=%d cpus=%s when=%s stats=%ld\n", join(c.split).c_str(), c.steal ? 1 : 0, join(c.slow_nodes).c_str(), c.samples,
+            "threads=%d cpus=%s when=%s stats=%ld ctl=%s\n", join(c.split).c_str(), c.steal ? 1 : 0, join(c.slow_nodes).c_str(), c.samples,
             !c.fake_experts.empty() ? "experts" : c.fake_b > c.fake_a ? "addr" : "-", c.prefetch ? 1 : 0, c.ring_mib,
-            join(c.ring_nodes).c_str(), c.pf_threads, join(c.pf_cpus).c_str(), c.release_at_end ? "end" : "now", c.stats);
+            join(c.ring_nodes).c_str(), c.pf_threads, join(c.pf_cpus).c_str(), c.release_at_end ? "end" : "now", c.stats, c.ctl.empty() ? "-" : c.ctl.c_str());
     return c;
 }
 
@@ -362,6 +394,52 @@ struct tier_state {
         }
     }
 
+    // GGML_TIER_CTL: re-read the file when it changed (checked at most every ctl_ms); "split=S[,S1..] steal=0|1
+    // prefetch=0|1" (missing keys keep their value). The counters so far are printed first, so each setting's share
+    // of the run reads as the difference of two lines.
+    std::chrono::steady_clock::time_point ctl_last{};
+    struct timespec ctl_mtime{};
+    off_t ctl_size = -1;
+    void poll_ctl() {
+        const config & c = cfg();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - ctl_last < std::chrono::milliseconds(c.ctl_ms)) return;
+        ctl_last = now;
+#if defined(__linux__)
+        struct stat sb;
+        if (stat(c.ctl.c_str(), &sb) != 0) return;
+        if (sb.st_mtim.tv_sec == ctl_mtime.tv_sec && sb.st_mtim.tv_nsec == ctl_mtime.tv_nsec && sb.st_size == ctl_size) return;
+        ctl_mtime = sb.st_mtim;
+        ctl_size = sb.st_size;
+        FILE * f = fopen(c.ctl.c_str(), "r");
+        if (!f) return;
+        char buf[512] = {0};
+        const size_t len = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[len] = 0;
+        print("ctl-before");
+        std::string text(buf);
+        for (char & ch : text) if (ch == '\n' || ch == '\t') ch = ' ';
+        size_t i = 0;
+        while (i < text.size()) {
+            const size_t j = std::min(text.find(' ', i), text.size());
+            const std::string kv = text.substr(i, j - i);
+            i = j + 1;
+            const size_t eq = kv.find('=');
+            if (eq == std::string::npos) continue;
+            const std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
+            if (k == "split") set_split(parse_list(v.c_str()));
+            else if (k == "steal") rt().steal.store(atoi(v.c_str()) != 0);
+            else if (k == "prefetch") rt().prefetch.store(atoi(v.c_str()) != 0);
+            else fprintf(stderr, "ggml tier ctl: unknown key %s\n", k.c_str());
+        }
+        std::vector<int> sp;
+        for (int g = 0; g < k_max_groups; ++g) sp.push_back(rt().split[g].load());
+        fprintf(stderr, "ggml tier ctl: split=%s steal=%d prefetch=%d (from %s: %s)\n", join(sp).c_str(), rt().steal.load() ? 1 : 0,
+                rt().prefetch.load() ? 1 : 0, c.ctl.c_str(), text.c_str());
+#endif
+    }
+
     void start_threads() {
         if (!threads.empty()) return;
         for (int i = 0; i < cfg().pf_threads; ++i) threads.emplace_back([this] { copier(); });
@@ -397,12 +475,11 @@ bool ggml_tier_on(void) {
 }
 
 int ggml_tier_split(int group) {
-    const auto & s = cfg().split;
-    return s.empty() ? 0 : s[std::min<size_t>((size_t) std::max(group, 0), s.size() - 1)];
+    return rt().split[std::min(std::max(group, 0), k_max_groups - 1)].load(std::memory_order_relaxed);
 }
 
 bool ggml_tier_steal(void) {
-    return cfg().steal;
+    return rt().steal.load(std::memory_order_relaxed);
 }
 
 void ggml_tier_op_begin(const struct ggml_tensor * w0, const struct ggml_tensor * w1, const int64_t * counts, int n_as,
@@ -429,8 +506,8 @@ void ggml_tier_op_begin(const struct ggml_tensor * w0, const struct ggml_tensor 
         if (!counts[e]) continue;
         (slow[e] ? s.n.used_slow : s.n.used_fast)++;
     }
-    if (!c.split.empty()) op->slow = slow;
-    if (!c.prefetch) return;
+    if (rt().split_any.load(std::memory_order_relaxed)) op->slow = slow;
+    if (!rt().prefetch.load(std::memory_order_relaxed)) return;
     weight * ws[2] = { a, b };
     for (int i = 0; i < 2; ++i) {
         weight * w = ws[i];
@@ -471,6 +548,7 @@ void ggml_tier_graph_end(void) {
     s.release();
     s.n.computes++;
     if (c.stats > 0 && s.n.computes % (uint64_t) c.stats == 0) s.print("stats");
+    if (!c.ctl.empty()) s.poll_ctl();
 }
 
 void ggml_tier_counts(uint64_t out[7]) {

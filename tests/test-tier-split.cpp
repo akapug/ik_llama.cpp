@@ -58,6 +58,12 @@ int child(int nth) {
     }
     for (int T : { 1, 5 }) {
         for (int step = 0; step < STEPS; ++step) {
+            if (const char * ctl = getenv("TEST_CTL_FILE")) {
+                // GGML_TIER_CTL: change the run-time values between steps (read at the end of the previous compute)
+                FILE * f = fopen(ctl, "w");
+                if (f) { fprintf(f, "split=%d prefetch=%d\n", step % 2 ? 2 : 0, step >= 1 ? 1 : 0); fclose(f); }
+                if (step == 0) ggml_tier_graph_end(); // the first read happens before the first compute
+            }
             ggml_tensor * x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, T);
             ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, USED, T);
             rng r{(uint64_t) (100 + step + 10*T)};
@@ -137,6 +143,7 @@ int main(int argc, char ** argv) {
         { "real node (move_pages)",   grp + " GGML_TIER_SPLIT=2 GGML_TIER_PREFETCH=1 GGML_TIER_RING_MIB=2 " + node, 1, SLOW | HITS },
         { "fake addr range",          grp + " GGML_TIER_SPLIT=2 GGML_TIER_PREFETCH=1 TEST_FAKE_ADDR_UP=1",   1, SLOW | HITS },
         { "split off, slow nodes set",grp + " " + node,                                                       1, NONE },
+        { "ctl file toggles",         grp + " GGML_TIER_CTL=/tmp/test-tier-ctl-" + std::to_string(getpid()) + " GGML_TIER_CTL_MS=0 TEST_CTL_FILE=/tmp/test-tier-ctl-" + std::to_string(getpid()) + " " + fake, 1, SLOW | HITS },
     };
     std::vector<result> ref(2);
     int fails = 0;

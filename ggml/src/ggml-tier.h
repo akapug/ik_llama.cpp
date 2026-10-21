@@ -33,6 +33,10 @@
 //  GGML_TIER_PREFETCH_WHEN=end  "end": a step's copy requests start when its CPU graph compute ends (default);
 //                               "now": at once, while the step still computes
 //  GGML_TIER_STATS=N            every N CPU graph computes (and at exit) print the counters
+//  GGML_TIER_CTL=path           the file's "split=S[,S1..] steal=0|1 prefetch=0|1" replaces those values while the process
+//                               runs (re-read when it changes, at most every GGML_TIER_CTL_MS, default 250 ms, at the end
+//                               of a CPU graph compute), so one server load serves several arms; the counters are printed
+//                               before each change. Setting it turns the tier hooks on (split 0 + prefetch 0 = control).
 
 #include "ggml.h"
 
