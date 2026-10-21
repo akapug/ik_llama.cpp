@@ -1071,7 +1071,21 @@ struct ggml_backend_vk_context {
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
     int num_additional_fused_ops {};
+
+    // GGML_VK_ASYNC_GRAPH=1: graph_compute returns after the last submit; the fence wait, the output staging copies
+    // and the graph cleanup run in ggml_vk_finish_pending (synchronize, or the next graph on this context)
+    bool graph_pending {};
+    std::shared_ptr<vk_context_struct> pending_exit;
+
+    // device memory of the lowered fork MoE intermediates, kept across graphs (grown on demand) instead of a new
+    // allocation per graph
+    ggml_backend_buffer_t lower_buf {};
 };
+
+static bool ggml_vk_async_graph() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_ASYNC_GRAPH"); return e && atoi(e) != 0; }();
+    return on;
+}
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
 
@@ -9795,7 +9809,10 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
             ggml_vk_submit(subctx, use_fence ? ctx->fence : vk::Fence{});
         }
 
-        if (use_fence) {
+        if (use_fence && tensor_idx == subctx->exit_tensor_idx && ggml_vk_async_graph() && !vk_perf_logger_enabled) {
+            ctx->graph_pending = true;
+            ctx->pending_exit = subctx;
+        } else if (use_fence) {
             ggml_vk_wait_for_fence(ctx);
         }
 #ifdef GGML_VULKAN_CHECK_RESULTS
@@ -9803,7 +9820,7 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
 #endif
     }
 
-    if (tensor_idx == subctx->exit_tensor_idx) {
+    if (tensor_idx == subctx->exit_tensor_idx && !(ctx->graph_pending && ctx->pending_exit == subctx)) {
         // Do staging buffer copies
         for (auto& cpy : subctx->out_memcpys) {
             memcpy(cpy.dst, cpy.src, cpy.n);
@@ -9850,9 +9867,30 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
 }
 
 // Clean up on backend free
+// GGML_VK_ASYNC_GRAPH: complete the graph whose last submit returned without waiting
+static void ggml_vk_finish_pending(ggml_backend_vk_context * ctx) {
+    if (!ctx->graph_pending) {
+        return;
+    }
+    ggml_vk_wait_for_fence(ctx);
+    for (auto & cpy : ctx->pending_exit->out_memcpys) {
+        memcpy(cpy.dst, cpy.src, cpy.n);
+    }
+    ctx->pending_exit->in_memcpys.clear();
+    ctx->pending_exit->out_memcpys.clear();
+    ctx->pending_exit.reset();
+    ctx->graph_pending = false;
+    ggml_vk_graph_cleanup(ctx);
+}
+
 static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_cleanup(" << ctx->name << ")");
+    ggml_vk_finish_pending(ctx);
     ggml_vk_graph_cleanup(ctx);
+    if (ctx->lower_buf) {
+        ggml_backend_buffer_free(ctx->lower_buf);
+        ctx->lower_buf = nullptr;
+    }
 
     ggml_vk_destroy_buffer(ctx->prealloc_x);
     ggml_vk_destroy_buffer(ctx->prealloc_y);
@@ -10224,6 +10262,7 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend, const ggml_
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    ggml_vk_finish_pending(ctx);
     if(ctx->transfer_ctx.expired()) {
         return;
     }
@@ -10343,9 +10382,35 @@ struct ggml_vk_lowered_graph {
             ggml_set_name(result, dst->name);
             nodes.push_back(result);
         }
-        buffer.reset(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
-        if (!buffer) {
-            return false;
+        // the intermediates live in one device buffer kept on the backend context (grown on demand): a new
+        // allocation per graph cost a vkAllocateMemory + free per bank split
+        ggml_backend_vk_context * vctx = (ggml_backend_vk_context *) backend->context;
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+        const size_t align = ggml_backend_buft_get_alignment(buft);
+        size_t need = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+            if (t->data == nullptr && t->view_src == nullptr) {
+                need += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
+            }
+        }
+        if (need > 0 && (!vctx->lower_buf || ggml_backend_buffer_get_size(vctx->lower_buf) < need)) {
+            if (vctx->lower_buf) {
+                ggml_backend_buffer_free(vctx->lower_buf);
+            }
+            vctx->lower_buf = ggml_backend_buft_alloc_buffer(buft, need);
+            if (!vctx->lower_buf) {
+                return false;
+            }
+        }
+        if (need > 0) {
+            ggml_tallocr talloc = ggml_tallocr_new(vctx->lower_buf);
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+                if (t->data == nullptr && t->view_src == nullptr) {
+                    ggml_tallocr_alloc(&talloc, t);
+                } else if (t->view_src != nullptr && t->buffer == nullptr) {
+                    ggml_backend_view_init(t);
+                }
+            }
         }
         graph.nodes = nodes.data();
         graph.n_nodes = nodes.size();
@@ -10355,6 +10420,8 @@ struct ggml_vk_lowered_graph {
 };
 
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    // a graph still in flight (GGML_VK_ASYNC_GRAPH) owns the lowered buffer and the command pools: finish it first
+    ggml_vk_finish_pending((ggml_backend_vk_context *) backend->context);
     ggml_vk_lowered_graph lowered;
     if (!lowered.lower(backend, cgraph)) {
         return GGML_STATUS_ALLOC_FAILED;
@@ -10362,6 +10429,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     cgraph = &lowered.graph;
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    ggml_vk_finish_pending(ctx);
 
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsLabelEXT dul = {};
@@ -10514,7 +10582,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->device->perf_logger->print_timings();
     }
 
-    ggml_vk_graph_cleanup(ctx);
+    if (!ctx->graph_pending) {
+        ggml_vk_graph_cleanup(ctx);
+    }
 
     return GGML_STATUS_SUCCESS;
 
@@ -10936,7 +11006,7 @@ static ggml_backend_i ggml_backend_vk_interface = {
     /* .set_tensor_async        = */ NULL,  // ggml_backend_vk_set_tensor_async,
     /* .get_tensor_async        = */ NULL,  // ggml_backend_vk_get_tensor_async,
     /* .cpy_tensor_async        = */ NULL,  // ggml_backend_vk_cpy_tensor_async,
-    /* .synchronize             = */ NULL,  // ggml_backend_vk_synchronize,
+    /* .synchronize             = */ ggml_backend_vk_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
     /* .graph_plan_update       = */ NULL,
