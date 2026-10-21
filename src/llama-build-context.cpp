@@ -1824,10 +1824,20 @@ llm_expert_gating_func_type   gating_op,
             cb(out, ("ffn_moe_down_" + tag).c_str(), il);
             return out;
         };
-        // model partitions (CPU part) first, then the side work and the GPU banks: they open the device split after it
+        // model partitions (CPU part) first, then the side work and the GPU banks: they open the device split after it.
+        // LLAMA_HOT_BANK_FIRST=1 puts the banks first instead, so their device split is issued before the CPU split
+        // (with an asynchronous bank backend the device then runs while the CPU computes the cold experts).
+        // LLAMA_HOT_COMBINE=<backend name> runs the partition sum on that backend (default: the bank backend), e.g.
+        // CUDA0 so the bank backend reads only the routing inputs and returns one tensor.
+        static const bool bank_first = [] { const char * e = getenv("LLAMA_HOT_BANK_FIRST"); return e && atoi(e) != 0; }();
+        static const char * combine_on = getenv("LLAMA_HOT_COMBINE");
+        std::vector<const llama_hot_experts::part *> order;
+        for (const auto & p : *parts) if (!bank_first || p.bank) order.push_back(&p);
+        if (bank_first) for (const auto & p : *parts) if (!p.bank) order.push_back(&p);
         ggml_backend_t pin = nullptr;
         bool side_done = !overlap;
-        for (const auto & p : *parts) {
+        for (const auto * pp : order) {
+            const auto & p = *pp;
             if (p.bank && !side_done) {
                 expand_side();
                 side_done = true;
@@ -1838,6 +1848,11 @@ llm_expert_gating_func_type   gating_op,
             experts = experts ? ggml_add(ctx, experts, out) : out;
         }
         if (!side_done) expand_side();
+        if (pin && combine_on && *combine_on) {
+            ggml_backend_t want = nullptr;
+            for (auto * be : lctx.backends) if (strcmp(ggml_backend_name(be), combine_on) == 0) want = be;
+            if (want) pin = want;
+        }
         if (pin) ggml_backend_sched_set_tensor_backend(lctx.sched, experts, pin);
     }
 
