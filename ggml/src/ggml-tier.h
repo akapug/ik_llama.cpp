@@ -28,6 +28,7 @@
 //  GGML_TIER_RING_MIB=M         ring size (default 1024)
 //  GGML_TIER_RING_NODES=list    slot k-th part bound to the k-th node, like a rows:A,B placement (default: the NUMA
 //                               nodes with CPUs, ascending; one node = no binding); "-" = no binding
+//  GGML_TIER_RING_POLICY=p      "preferred" (default: a full node falls back to another) or "bind" (a full node OOMs)
 //  GGML_TIER_PREFETCH_THREADS=N copy threads (default 1)
 //  GGML_TIER_PREFETCH_CPUS=list CPUs the copy threads run on (default: the process mask at start, not the pinned
 //                               mask of the compute thread that starts them)
