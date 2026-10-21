@@ -14,6 +14,7 @@
 #include "ggml-aarch64.h"
 #include "ggml-moe-prefetch.h"
 #include "ggml-tier.h"
+#include "ggml-numa-experts.h"
 #include "iqk/iqk_quantize.h"
 #include "iqk/iqk_cpu_ops.h"
 #if GGML_USE_IQK_MULMAT
@@ -3073,6 +3074,7 @@ struct ggml_compute_state_shared {
 
     atomic_int group_chunk_slow[GGML_MOE_MAX_GROUPS]; // GGML_TIER_SPLIT: next chunk of the slow-tier list per group
     struct ggml_tier_op tier_op; // GGML_TIER_*: the current routed-expert op's tiers and read pointers (thread 0 writes)
+    const int8_t * numa_owner;   // GGML_NUMA_EXPERTS: owner group of each expert of the current routed-expert op (thread 0 writes)
 };
 
 struct ggml_compute_state {
@@ -4972,6 +4974,9 @@ static inline void ggml_barrier_impl(struct ggml_compute_state_shared * shared) 
 //                          every CUDA launch/copy/sync) takes no routed-expert chunks and does not quantize the
 //                          activations, so its core runs no dense AVX-512 and need not drop to the AVX-512 clock
 //                          license for the host work between CPU splits; its group's other threads take its rows.
+//  GGML_NUMA_EXPERTS=list  (ggml-numa-experts.h) one thread group per listed NUMA node, replacing GGML_MOE_GROUPS: an
+//                          expert whose pages sit on a group's node is computed whole by that group (the same row
+//                          slices, so bit-identical results); the other experts are shared as with GGML_MOE_GROUPS.
 struct ggml_cpu_knobs {
     int    barrier_spin;
     int    fast_entry;
@@ -5001,6 +5006,14 @@ static const struct ggml_cpu_knobs * ggml_get_cpu_knobs(void) {
                 k.moe_groups = MIN(g, GGML_MOE_MAX_GROUPS);
                 k.moe_chunks = MAX(c, 0);
             }
+        }
+        const int numa_groups = ggml_numa_experts_groups(NULL);
+        if (numa_groups > 0) {
+            // GGML_NUMA_EXPERTS: one thread group per listed node
+            if (k.moe_groups && k.moe_groups != numa_groups) {
+                fprintf(stderr, "ggml cpu knobs: GGML_NUMA_EXPERTS names %d groups; GGML_MOE_GROUPS=%d ignored\n", numa_groups, k.moe_groups);
+            }
+            k.moe_groups = numa_groups;
         }
         if (k.main_no_moe && !k.moe_groups) {
             fprintf(stderr, "ggml cpu knobs: GGML_MAIN_NO_MOE needs GGML_MOE_GROUPS (its rows go to its group); ignored\n");
@@ -18738,6 +18751,11 @@ struct ggml_moe_group_iter {
     int tier;             // the list this thread takes chunks from
     int left;             // lists this thread still visits (2 = steal from the other list when its own runs dry)
     int t_last_a[2], t_last_acc[2];
+    // GGML_NUMA_EXPERTS: list h (group h's counter) = every chunk of the experts group h owns, then group h's slice of
+    // the shared ones; a thread walks its own group's list, then (steal) the other groups' lists in turn
+    const int8_t * owner; // [n_as] owner group, -1 = shared; NULL = no expert sharding for this op
+    int list;             // the list this thread takes chunks from
+    int stolen;           // chunks taken from other groups' lists (counted once, when the walk ends)
 };
 
 static bool ggml_moe_group_init(const struct ggml_compute_params * params, struct ggml_moe_group_iter * it) {
@@ -18755,6 +18773,13 @@ static bool ggml_moe_group_init(const struct ggml_compute_params * params, struc
     it->last_a = 0;
     it->last_acc = 0;
     it->skip = g_cpu_knobs.main_no_moe && params->ith == 0 && (params->nth + G - 1) / G >= 2;
+    it->owner = G == ggml_numa_experts_groups(NULL) ? params->shared->numa_owner : NULL;
+    if (it->owner) {
+        it->list = it->g;
+        it->left = ggml_numa_experts_steal() ? G : 1;
+        it->stolen = 0;
+        slow = NULL; // expert sharding replaces the tier split's lists (the tier prefetch still serves the reads)
+    }
     it->slow = slow;
     if (slow) {
         // group g = threads [first, next); its last S threads start on the slow list (thread 0, a skipped one, is first)
@@ -18778,6 +18803,36 @@ static inline int ggml_moe_src1_ith(int ith, int nth) {
 
 static bool ggml_moe_group_next(struct ggml_compute_state_shared * shared, struct ggml_moe_group_iter * it,
         const int64_t * counts, int n_as, int * cur_a, int * chunk, int * n_chunks) {
+    if (it->owner) {
+        while (it->left > 0) {
+            const int h = it->list;
+            const int k = atomic_fetch_add(&shared->group_chunk[h], 1);
+            int acc = it->last_acc;
+            for (int a = it->last_a; a < n_as; a++) {
+                if (counts[a] == 0) continue;
+                const int o = it->owner[a];
+                const int n = o == h ? it->G*it->C : o < 0 ? it->C : 0; // an owned expert: all G*C slices; shared: h's C
+                if (k < acc + n) {
+                    it->last_a = a;
+                    it->last_acc = acc;
+                    *cur_a = a;
+                    *chunk = o == h ? k - acc : h*it->C + (k - acc);
+                    *n_chunks = it->G*it->C;
+                    it->stolen += h != it->g;
+                    return true;
+                }
+                acc += n;
+            }
+            // this list has no chunk left (its counter only grows): go to the next group's
+            it->left--;
+            it->list = (it->list + 1) % it->G;
+            it->last_a = 0;
+            it->last_acc = 0;
+        }
+        if (it->stolen) ggml_numa_experts_count_steal(it->stolen);
+        it->stolen = 0;
+        return false;
+    }
     if (it->slow) {
         while (it->left > 0) {
             const int t = it->tier;
@@ -18932,6 +18987,7 @@ static void ggml_compute_forward_mul_mat_id(
         if (ggml_tier_on()) {
             ggml_tier_op_begin(src0, NULL, matrix_row_counts, n_as, &params->shared->tier_op);
         }
+        params->shared->numa_owner = ggml_numa_experts_on() ? ggml_numa_experts_op_begin(src0, NULL, matrix_row_counts, n_as) : NULL;
     }
 
     if (ith == 0) {
@@ -19287,6 +19343,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
         if (ggml_tier_on()) {
             ggml_tier_op_begin(src0_1, src0_2, matrix_row_counts, n_as, &params->shared->tier_op);
         }
+        params->shared->numa_owner = ggml_numa_experts_on() ? ggml_numa_experts_op_begin(src0_1, src0_2, matrix_row_counts, n_as) : NULL;
     }
 
 #if defined GGML_EXPERT_CHUNKING

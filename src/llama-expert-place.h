@@ -2,7 +2,9 @@
 
 // Per-expert weight placement for CPU-resident routed experts.
 //
-// 1. NUMA placement (env LLAMA_EXPERT_PLACEMENT=/path.tsv, needs --no-mmap):
+// 1. NUMA placement (env LLAMA_EXPERT_PLACEMENT=/path.tsv and/or GGML_NUMA_EXPERTS; needs --no-mmap or a model file on
+//    tmpfs/hugetlbfs: an mmap'ed tmpfs copy has its planned pages faulted in and moved after the load, since mbind on
+//    shared memory sets the file's own policy, while a disk-file mmap ignores mbind and is skipped):
 //    each expert of a 3D expert tensor [ne0, ne1, n_expert] is a contiguous byte slice
 //    (nb[2] bytes). The placement file binds slices to NUMA nodes with mbind(2) before
 //    the tensor data is read, so every page faults directly onto its target node
@@ -15,6 +17,10 @@
 //    field is "*" (one block) or "/G" (G equal consecutive blocks, each split by a rows policy: a grouped weight such as
 //    the DeepSeek-V4 attn_output_a). With -cr in node order, the static row split of a dense matmul then gives node k's
 //    threads slice k of every block.
+//    GGML_NUMA_EXPERTS=<node per thread group> (ggml/src/ggml-numa-experts.h) adds the auto plan for every expert tensor
+//    no rule names: expert e of layer il binds whole to the node of group owner[e] of ggml_numa_experts_partition
+//    (salt il, weights GGML_NUMA_EXPERTS_WEIGHTS or the nodes' memory/CPU shares; experts LLAMA_HOT_EXPERTS banks on a
+//    GPU are dealt separately so the host ones stay balanced), and the CPU kernels hand each such expert to that group.
 //
 // 2. Static GPU hot-expert set (env LLAMA_HOT_EXPERTS=/path.tsv):
 //    copies of the listed experts live in a per-layer bank on the GPU. For small
