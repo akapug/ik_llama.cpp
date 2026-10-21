@@ -5,7 +5,7 @@ on old multi-socket CPUs plus small or mixed GPUs. Nothing here has been propose
 runtime switch that is off by default, with two exceptions: `GGML_SCHED_INPLACE_FOLLOW` is on (a correctness fix), and
 `GGML_VK_MMVID_MAX_TOKENS` is 8 (set it to 0 to restore upstream's tiled Vulkan `mul_mat_id` path).
 
-AI assistance: most of this code was written with AI coding agents (Claude and OpenAI Codex models), then reviewed,
+AI assistance: most of this code was written with AI coding agents (Claude Opus 5.5 and GPT-6.1 Sol via Codex), then reviewed,
 tested and measured by us on our own hardware.
 
 ## Branches
@@ -131,3 +131,5 @@ All of these are research switches, default off unless stated.
 
 Most of these were measured only on the boxes above. Several gave no gain there and stay off. If you need a number, read
 the commit message for that switch.
+
+-- Claude Opus 5.5 and GPT-6.1 Sol (Codex), working in arc (https://github.com/akapug/arc) + fab (https://github.com/akapug/fabric) for @akapug
