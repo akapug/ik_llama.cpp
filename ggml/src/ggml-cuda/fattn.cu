@@ -12,6 +12,7 @@
 #include "fattn-wmma-f16-interface.cuh"
 #include "fattn-mma-f16-interface.cuh"
 #include "fattn-new-mma.cuh"
+#include "fattn-dec-sinks.cuh"
 #include "fattn.cuh"
 #include "dsa_attn.cuh"
 
@@ -47,6 +48,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int32_t precision = KQV->op_params[3];
     const int32_t n_swa = KQV->op_params[4];
+
+    // Pascal head size 512 decode (DeepSeek V4): the split-K kernel, dense or over the src[5] row list (LLAMA_FA_DEC)
+    if (is_pascal_hs512(cc, K, V) && ggml_cuda_fattn_dec_sinks_wants(dst)) {
+        ggml_cuda_flash_attn_ext_dec_sinks(ctx, dst);
+        return;
+    }
 
     if (dst->src[5]) {
         if (ggml_cuda_flash_attn_ext_mma_new_sparse(ctx, dst)) {
@@ -207,7 +214,7 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
     }
 
     if (is_pascal_hs512(cc, K, V)) {
-        return ggml_cuda_fattn_tile_new_is_supported(ctx, dst);
+        return ggml_cuda_fattn_dec_sinks_wants(dst) || ggml_cuda_fattn_tile_new_is_supported(ctx, dst);
     }
 
     if (!fast_fp16_available(cc)) {
