@@ -1,7 +1,8 @@
 // test-fattn-sinks: GGML_OP_FLASH_ATTN_EXT with attention sinks at head size 512 (DeepSeek V4 shape: K == V, one KV head,
 // F32 sinks per Q head, F16 mask, F32 precision) on a CUDA device against the CPU backend. On Pascal (sm_6x) this is the
 // tile_new kernel; before its sink support the op was refused and ran on the CPU.
-//   test-fattn-sinks [device=0]   exit 0 when every case is supported on the device and matches the CPU (NMSE < 1e-6)
+//   test-fattn-sinks [device=0]   exit 0 when every case is supported on the device and matches the CPU (NMSE < 1e-3;
+// the generic CPU FA, the V4 reference, sits near 1e-5..1e-4 against any device kernel), and a dropped sink is caught
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -27,6 +28,7 @@ std::vector<float> run(ggml_backend_t be, const shape & s, uint32_t seed, bool &
     ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, s.n_kv, n_pad, 1, 1);
     ggml_tensor * snk  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, s.n_head);
     ggml_tensor * out  = ggml_flash_attn_ext(ctx, q, k, k, mask, 1.0f / std::sqrt((float) D), 0.0f, 0.0f);
+    out->op_params[4] = GGML_FLASH_ATTN_EXT_IQK_DISABLED;   // as build_deepseek4: the CPU reference is the generic FA
     if (s.sinks) ggml_flash_attn_ext_add_sinks(out, snk);
     ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
@@ -42,7 +44,7 @@ std::vector<float> run(ggml_backend_t be, const shape & s, uint32_t seed, bool &
         for (int j = 0; j < s.n_kv; ++j)
             mv[(size_t) t * s.n_kv + j] = ggml_fp32_to_fp16(j >= s.n_kv - s.masked_tail ? -INFINITY : 0.0f);
     std::vector<float> sv(s.n_head);
-    for (auto & v : sv) v = 2.0f * nd(rng);
+    for (auto & v : sv) v = 4.0f + 2.0f * nd(rng);   // sinks carry a large share of the softmax mass
     ggml_backend_tensor_set(q, qv.data(), 0, ggml_nbytes(q));
     ggml_backend_tensor_set(k, kv.data(), 0, ggml_nbytes(k));
     ggml_backend_tensor_set(mask, mv.data(), 0, ggml_nbytes(mask));
@@ -86,10 +88,23 @@ int main(int argc, char ** argv) {
         double num = 0.0, den = 0.0;
         for (size_t i = 0; i < c.size(); ++i) { num += (g[i] - c[i]) * (double) (g[i] - c[i]); den += c[i] * (double) c[i]; }
         const double nmse = den > 0 ? num / den : 0.0;
-        const bool ok = sup_g && sup_c && nmse < 1e-6;
+        const bool ok = sup_g && sup_c && nmse < 1e-3;
         fails += ok ? 0 : 1;
         printf("%s heads %d n_kv %d tokens %d masked %d sinks %d: device %s, NMSE %.3g\n", ok ? "PASS" : "FAIL",
                s.n_head, s.n_kv, s.n_tokens, s.masked_tail, s.sinks, sup_g ? "runs it" : "REFUSES it", nmse);
+    }
+    // discrimination: the device result with sinks against the CPU without them must differ well above the bar
+    {
+        shape with = shapes[1], without = shapes[1];
+        without.sinks = false;
+        bool a = false, b = false;
+        const std::vector<float> g = run(gpu, with, 99, a);
+        const std::vector<float> c = run(cpu, without, 99, b);
+        double num = 0.0, den = 0.0;
+        for (size_t i = 0; i < c.size(); ++i) { num += (g[i] - c[i]) * (double) (g[i] - c[i]); den += c[i] * (double) c[i]; }
+        const bool ok = a && b && den > 0 && num / den > 1e-3;   // must fail the pass bar
+        fails += ok ? 0 : 1;
+        printf("%s a dropped sink is caught: NMSE %.3g (bar 1e-3)\n", ok ? "PASS" : "FAIL", den > 0 ? num / den : 0.0);
     }
     ggml_backend_free(gpu);
     ggml_backend_free(cpu);
