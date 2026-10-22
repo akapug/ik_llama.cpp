@@ -872,9 +872,11 @@ bool ggml_cuda_fattn_tile_new_is_supported(ggml_backend_cuda_context & ctx, cons
 
     // Only the variants that pack 4 or 8 Q heads per K/V head are compiled. Everything else stays on the CPU.
     // Sinks (an F32 logit per Q head) are applied after the KV loop (DeepSeek V4's attention, LLAMA_FA_TILE_NEW_SINKS=0
-    // keeps such ops on the CPU as before).
+    // keeps such ops on the CPU as before). LLAMA_FA_TILE_NEW_SINKS_MIN_Q (default 1) keeps sink ops with fewer Q rows on
+    // the CPU: on a GTX 1080 Ti this kernel is slower than the CPU for 1-row decode but faster for verify/prefill batches.
     static const bool sinks_on = !getenv("LLAMA_FA_TILE_NEW_SINKS") || atoi(getenv("LLAMA_FA_TILE_NEW_SINKS")) != 0;
-    if (sinks && (!sinks_on || sinks->type != GGML_TYPE_F32 || sinks->ne[0] < Q->ne[2])) {
+    static const int64_t sinks_min_q = getenv("LLAMA_FA_TILE_NEW_SINKS_MIN_Q") ? atoll(getenv("LLAMA_FA_TILE_NEW_SINKS_MIN_Q")) : 1;
+    if (sinks && (!sinks_on || Q->ne[1] < sinks_min_q || sinks->type != GGML_TYPE_F32 || sinks->ne[0] < Q->ne[2])) {
         return false;
     }
     if (K->ne[0] != 512 || V->ne[0] != 512 || !mask || max_bias != 0.0f || logit_softcap != 0.0f) {
