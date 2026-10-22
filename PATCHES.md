@@ -21,6 +21,7 @@ Each branch contains the one before it.
 | `sched-inplace-follow` | scheduler fix that makes DeepSeek V4 attention correct on GPUs that cannot run its flash attention (sm_61) |
 | `mixed-cuda-vulkan-expert-banks` | CUDA and Vulkan in one process, hot expert banks on a Vulkan device (MI25), MXFP4 on Vulkan, staged Vulkan I/O |
 | `numa-experts` | `mixed-cuda-vulkan-expert-banks` merged with upstream `15e7ecac` and `tier-split` (expert pre-binding, `GGML_TIER_*`), plus NUMA-local expert sharding |
+| `fa-tile-sinks` | attention sinks in the CUDA tile flash-attention kernel for Pascal (DeepSeek V4 attention on a GTX 1080 Ti) |
 
 ## Test hardware
 
@@ -210,6 +211,18 @@ placements stay shared as with `GGML_MOE_GROUPS`. Steal (default on) lets an idl
 The row slices match the static split, so the result is bit-identical. `tests/test-numa-experts.cpp` pins itself to
 the CPUs and memory of one node, so a child arm's heap cannot spill elsewhere and read as shared. Measured so far only
 for correctness (Box A, 64 threads, nodes 0-7, 3 of 3 runs clean); no speed figure yet.
+
+## Attention sinks on Pascal (`fa-tile-sinks`)
+
+DeepSeek V4 attention uses a head size of 512 with attention sinks, which the CUDA tile flash-attention kernel refused
+on sm_6x, so on a GTX 1080 Ti every such op ran on the CPU with its K/V copied to the host per layer. The kernel now
+applies the sink logit after the KV loop. **`LLAMA_FA_TILE_NEW_SINKS=0`** keeps those ops on the CPU (A/B in one
+binary). **`LLAMA_FA_TILE_NEW_SINKS_MIN_Q=N`** (default 1, no change) keeps ops with fewer than N query rows on the CPU.
+
+Box A (GTX 1080 Ti, V4.1 Flash Q8_0): with the kernel on the GPU, 1-row decode fell from 7.95 to 5.14 tok/s (the CPU
+MoE split waits on the GPU split), while draft verify rose from 6.59 to 7.71 tok/s and prefill from 47.8 to 53.1 tok/s.
+`MIN_Q=2` keeps decode rows on the CPU and sends verify and prefill batches to the GPU. `tests/test-fattn-sinks.cpp`
+checks D=512 with sinks against a generic CPU reference (NMSE under 1e-3, and a dropped-sink case must fail).
 
 ## Older patches (in every branch)
 
